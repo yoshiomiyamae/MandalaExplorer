@@ -158,6 +158,9 @@ struct PlaybackInfo {
 
 impl MandalaApp {
     pub fn new(cc: &eframe::CreationContext<'_>, start: PathBuf) -> anyhow::Result<Self> {
+        // Before anything draws, or the first frame is all boxes.
+        crate::fonts::install_fallbacks(&cc.egui_ctx);
+
         let backend = MediaFoundation::new()?;
 
         // Workers wake the UI thread when they have something to show, rather
@@ -595,15 +598,26 @@ impl MandalaApp {
         }
 
         if self.settings.show_labels {
-            let label_rect =
-                Rect::from_min_max(Pos2::new(rect.min.x + 6.0, rect.max.y - LABEL_HEIGHT), rect.max);
-            painter.text(
-                label_rect.left_center(),
-                Align2::LEFT_CENTER,
-                elide(&entry.name, rect.width()),
+            let label_rect = Rect::from_min_max(
+                Pos2::new(rect.min.x + 6.0, rect.max.y - LABEL_HEIGHT),
+                Pos2::new(rect.max.x - 6.0, rect.max.y),
+            );
+            // Laid out rather than trimmed by character count: a full-width
+            // Japanese character is about twice as wide as a Latin one, so
+            // counting characters would either overflow the tile or cut names
+            // far shorter than they need to be. egui measures and adds its own
+            // ellipsis.
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                entry.name.clone(),
                 FontId::proportional(12.0),
                 visuals.text_color(),
             );
+            job.wrap.max_width = label_rect.width();
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let galley = painter.layout_job(job);
+            let baseline = label_rect.left_center() - Vec2::new(0.0, galley.size().y / 2.0);
+            painter.galley(baseline, galley, visuals.text_color());
         }
     }
 }
@@ -786,18 +800,6 @@ fn fit_rect(bounds: Rect, size: Vec2) -> Rect {
     }
     let scale = (bounds.width() / size.x).min(bounds.height() / size.y);
     Rect::from_center_size(bounds.center(), size * scale)
-}
-
-/// Trims a name to roughly what fits, so long filenames do not spill over the
-/// tile next door.
-fn elide(name: &str, width: f32) -> String {
-    // Proportional text averages a bit under half the font size per character.
-    let budget = ((width - 12.0) / 6.0).max(4.0) as usize;
-    if name.chars().count() <= budget {
-        return name.to_owned();
-    }
-    let keep: String = name.chars().take(budget.saturating_sub(1)).collect();
-    format!("{keep}…")
 }
 
 fn draw_placeholder(painter: &egui::Painter, area: Rect, kind: MediaKind, visuals: &egui::Visuals) {
@@ -1045,21 +1047,4 @@ mod tests {
         assert!(settle.update(100.2, start + SCROLL_SETTLE));
     }
 
-    #[test]
-    fn short_names_are_left_alone() {
-        assert_eq!(elide("cat.jpg", 200.0), "cat.jpg");
-    }
-
-    #[test]
-    fn long_names_are_trimmed_with_an_ellipsis() {
-        let name = "a-really-quite-long-file-name-indeed.mp4";
-        let got = elide(name, 100.0);
-        assert!(got.ends_with('…'), "got {got}");
-        assert!(got.chars().count() < name.chars().count());
-    }
-
-    #[test]
-    fn eliding_keeps_at_least_a_few_characters_in_a_narrow_tile() {
-        assert!(elide("abcdefghij", 0.0).chars().count() >= 4);
-    }
 }

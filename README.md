@@ -81,6 +81,14 @@ was last drawn at. Anything already thumbnailed knows its length for free, and
 sorting by length only probes the files it still has to ask about, a few per
 frame so one enormous folder cannot flood the queue.
 
+**Non-Latin names are readable.** egui carries Latin coverage only, so system
+fonts are loaded at startup as fallbacks -- Japanese, plus Korean and Simplified
+Chinese where present. Each one carries a measured baseline correction, because
+faces disagree about where the baseline sits and the mismatch shows up as the
+extension sliding below the name it belongs to. Labels are laid out and elided
+by egui rather than trimmed by character count, since a full-width character is
+about twice the width of a Latin one.
+
 **The cache is capped.** Thumbnails live in
 `%LOCALAPPDATA%\mandala\thumbnails`, sharded by hash so no directory holds a
 hundred thousand entries, and keyed on path, size, modification time and size
