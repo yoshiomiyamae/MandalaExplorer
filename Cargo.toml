@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/mandala-core", "crates/mandala-media", "crates/mandala-app"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+mandala-core = { path = "crates/mandala-core" }
+mandala-media = { path = "crates/mandala-media" }
+
+anyhow = "1.0"
+blake3 = "1.8"
+crossbeam-channel = "0.5"
+eframe = { version = "0.36", features = ["persistence"] }
+egui = "0.36"
+image = "0.25"
+parking_lot = "0.12"
+rayon = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+walkdir = "2.5"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
