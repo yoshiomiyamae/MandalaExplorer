@@ -21,6 +21,21 @@ pub const AMBIENT_FPS: f32 = 15.0;
 /// Frame rate for the tile under the cursor, which is the one being looked at.
 pub const HOVER_FPS: f32 = 30.0;
 
+/// What a worker sends back.
+pub enum SlotEvent {
+    Frame(DecodedFrame),
+    /// The stream stopped working, so the slot is idle again.
+    ///
+    /// Worth saying rather than just falling silent: a decoder dies for
+    /// reasons outside the file, above all its GPU device being lost, and a
+    /// slot that is recorded as playing but is not gets no second chance. Said
+    /// out loud, the tile is rescheduled on the next frame and opens against
+    /// whatever device exists by then.
+    Lost {
+        tile: usize,
+    },
+}
+
 /// A frame ready for its tile.
 pub struct DecodedFrame {
     pub tile: usize,
@@ -47,7 +62,7 @@ enum Command {
 }
 
 /// Spawns one worker thread, wired to its command channel and the shared sink.
-type SpawnSlot = Box<dyn Fn(usize, Receiver<Command>, Sender<DecodedFrame>)>;
+type SpawnSlot = Box<dyn Fn(usize, Receiver<Command>, Sender<SlotEvent>)>;
 
 struct SlotHandle {
     commands: Sender<Command>,
@@ -60,9 +75,9 @@ pub struct PlaybackService {
     slots: Vec<SlotHandle>,
     /// Mirrors `slots[i].holding`, so it can be handed out as a slice.
     holding: Vec<Option<usize>>,
-    frames: Receiver<DecodedFrame>,
+    events: Receiver<SlotEvent>,
     /// Kept so resizing the pool can spawn more slots wired to the same sink.
-    frame_sink: Sender<DecodedFrame>,
+    event_sink: Sender<SlotEvent>,
     spawn: SpawnSlot,
 }
 
@@ -71,7 +86,7 @@ impl PlaybackService {
         backend: B,
         on_frame: impl Fn() + Send + Clone + 'static,
     ) -> Self {
-        let (frame_sink, frames) = unbounded();
+        let (event_sink, events) = unbounded();
         let spawn = Box::new(move |slot: usize, commands, sink| {
             let backend = backend.clone();
             let on_frame = on_frame.clone();
@@ -80,7 +95,7 @@ impl PlaybackService {
                 .spawn(move || run_slot(commands, sink, backend, on_frame))
                 .expect("spawning a playback worker");
         });
-        Self { slots: Vec::new(), holding: Vec::new(), frames, frame_sink, spawn }
+        Self { slots: Vec::new(), holding: Vec::new(), events, event_sink, spawn }
     }
 
     /// What each slot is playing, in slot order -- the input to slot planning.
@@ -108,7 +123,7 @@ impl PlaybackService {
         }
         while self.slots.len() < count {
             let (commands, receiver) = unbounded();
-            (self.spawn)(self.slots.len(), receiver, self.frame_sink.clone());
+            (self.spawn)(self.slots.len(), receiver, self.event_sink.clone());
             self.slots.push(SlotHandle { commands, holding: None, fps: AMBIENT_FPS });
         }
         self.holding.resize(self.slots.len(), None);
@@ -177,8 +192,24 @@ impl PlaybackService {
         self.sync_holding();
     }
 
-    pub fn drain(&self) -> impl Iterator<Item = DecodedFrame> + '_ {
-        self.frames.try_iter()
+    /// Takes whatever the workers have produced since the last call.
+    ///
+    /// Also frees any slot that reported its stream lost, so the scheduler can
+    /// hand that tile to a fresh decoder on the next frame.
+    pub fn drain(&mut self) -> Vec<SlotEvent> {
+        let events: Vec<SlotEvent> = self.events.try_iter().collect();
+        let lost = events.iter().any(|e| matches!(e, SlotEvent::Lost { .. }));
+        for event in &events {
+            if let SlotEvent::Lost { tile } = event
+                && let Some(handle) = self.slots.iter_mut().find(|h| h.holding == Some(*tile))
+            {
+                handle.holding = None;
+            }
+        }
+        if lost {
+            self.sync_holding();
+        }
+        events
     }
 }
 
@@ -212,13 +243,20 @@ impl Playing {
     }
 }
 
+/// Tells the UI a slot has gone quiet, and wakes it so it acts on that.
+fn report_lost(events: &Sender<SlotEvent>, on_frame: &impl Fn(), tile: usize) {
+    if events.send(SlotEvent::Lost { tile }).is_ok() {
+        on_frame();
+    }
+}
+
 fn interval_for(fps: f32) -> Duration {
     Duration::from_secs_f32(1.0 / fps.clamp(1.0, 120.0))
 }
 
 fn run_slot(
     commands: Receiver<Command>,
-    frames: Sender<DecodedFrame>,
+    events: Sender<SlotEvent>,
     backend: impl MediaBackend,
     on_frame: impl Fn(),
 ) {
@@ -293,7 +331,7 @@ fn run_slot(
                     duration: state.stream.duration(),
                     frame,
                 };
-                if frames.send(decoded).is_err() {
+                if events.send(SlotEvent::Frame(decoded)).is_err() {
                     return;
                 }
                 on_frame();
@@ -303,12 +341,16 @@ fn run_slot(
                 // Loop. Rebasing the clock keeps the next target near zero
                 // rather than seeking forward through the whole file again.
                 if state.stream.restart().is_err() {
+                    report_lost(&events, &on_frame, state.tile);
                     playing = None;
                 } else {
                     state.rebase(Duration::ZERO);
                 }
             }
-            Err(_) => playing = None,
+            Err(_) => {
+                report_lost(&events, &on_frame, state.tile);
+                playing = None;
+            }
         }
     }
 }
@@ -327,10 +369,19 @@ mod tests {
         restarts: Arc<AtomicUsize>,
         seeks: Seeks,
         clock: Duration,
+        /// Frames to hand out before failing, standing in for a decoder whose
+        /// device disappeared underneath it.
+        die_after: Option<usize>,
     }
 
     impl VideoStream for FakeStream {
         fn advance_to(&mut self, _target: Duration) -> Result<Advance> {
+            if let Some(left) = self.die_after.as_mut() {
+                if *left == 0 {
+                    anyhow::bail!("device lost");
+                }
+                *left -= 1;
+            }
             if self.frames_left == 0 {
                 return Ok(Advance::EndOfStream);
             }
@@ -370,6 +421,8 @@ mod tests {
         seeks: Seeks,
         /// Paths containing this fragment fail to open.
         fail_on: &'static str,
+        /// Frames each stream produces before failing, if it should.
+        die_after: Option<usize>,
     }
 
     impl MediaBackend for FakeBackend {
@@ -383,6 +436,7 @@ mod tests {
                 restarts: Arc::clone(&self.restarts),
                 seeks: Arc::clone(&self.seeks),
                 clock: Duration::ZERO,
+                die_after: self.die_after,
             }))
         }
 
@@ -411,6 +465,7 @@ mod tests {
             restarts: Arc::clone(&restarts),
             seeks: Arc::clone(&seeks),
             fail_on: "broken",
+            die_after: None,
         };
         (PlaybackService::new(backend, || {}), opened, restarts, seeks)
     }
@@ -422,6 +477,18 @@ mod tests {
 
     fn source(_tile: usize) -> Option<(PathBuf, (u32, u32))> {
         Some((PathBuf::from("fake.mp4"), (64, 64)))
+    }
+
+    /// Frames only, for tests that do not care about loss reports.
+    fn frames(service: &mut PlaybackService) -> Vec<DecodedFrame> {
+        service
+            .drain()
+            .into_iter()
+            .filter_map(|e| match e {
+                SlotEvent::Frame(frame) => Some(frame),
+                SlotEvent::Lost { .. } => None,
+            })
+            .collect()
     }
 
     /// Waits for a condition, so tests do not depend on worker scheduling.
@@ -459,7 +526,7 @@ mod tests {
 
         assert!(eventually(|| opened.load(Ordering::SeqCst) > 0), "video was never opened");
         assert!(
-            eventually(|| service.drain().next().is_some()),
+            eventually(|| !frames(&mut service).is_empty()),
             "no frame arrived from a playing slot"
         );
     }
@@ -472,7 +539,7 @@ mod tests {
 
         let mut seen = None;
         eventually(|| {
-            if let Some(frame) = service.drain().next() {
+            if let Some(frame) = frames(&mut service).into_iter().next() {
                 seen = Some((frame.tile, frame.generation));
                 return true;
             }
@@ -486,15 +553,15 @@ mod tests {
         let (mut service, _, _) = service();
         service.resize(1);
         service.apply(&SlotPlan { stop: vec![], start: vec![(0, 1)] }, 1, None, source);
-        assert!(eventually(|| service.drain().next().is_some()));
+        assert!(eventually(|| !frames(&mut service).is_empty()));
 
         service.apply(&SlotPlan { stop: vec![0], start: vec![] }, 1, None, source);
         assert_eq!(service.holding(), [None]);
 
         // Drain whatever was already in flight, then confirm it stays quiet.
-        let _ = service.drain().count();
+        let _ = service.drain();
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(service.drain().count(), 0, "a stopped slot kept decoding");
+        assert!(frames(&mut service).is_empty(), "a stopped slot kept decoding");
     }
 
     #[test]
@@ -505,7 +572,7 @@ mod tests {
 
         assert!(
             eventually(|| {
-                let _ = service.drain().count();
+                let _ = service.drain();
                 restarts.load(Ordering::SeqCst) > 0
             }),
             "a finished clip should have looped"
@@ -521,7 +588,7 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(service.drain().count(), 0, "a broken file should not produce frames");
+        assert!(frames(&mut service).is_empty(), "a broken file should not produce frames");
     }
 
     #[test]
@@ -562,7 +629,7 @@ mod tests {
         let (mut service, _, _, seeks) = service_with_seeks();
         service.resize(2);
         service.apply(&SlotPlan { stop: vec![], start: vec![(0, 5)] }, 1, None, source);
-        assert!(eventually(|| service.drain().next().is_some()));
+        assert!(eventually(|| !frames(&mut service).is_empty()));
 
         service.seek(5, Duration::from_secs(3));
         assert!(
@@ -576,7 +643,7 @@ mod tests {
         let (mut service, _, _, seeks) = service_with_seeks();
         service.resize(1);
         service.apply(&SlotPlan { stop: vec![], start: vec![(0, 5)] }, 1, None, source);
-        assert!(eventually(|| service.drain().next().is_some()));
+        assert!(eventually(|| !frames(&mut service).is_empty()));
 
         service.seek(99, Duration::from_secs(3));
         std::thread::sleep(Duration::from_millis(150));
@@ -591,13 +658,40 @@ mod tests {
 
         let mut seen = None;
         eventually(|| {
-            if let Some(decoded) = service.drain().next() {
+            if let Some(decoded) = frames(&mut service).into_iter().next() {
                 seen = Some(decoded.duration);
                 return true;
             }
             false
         });
         assert_eq!(seen, Some(Some(Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn a_stream_that_dies_frees_its_slot_for_another_decoder() {
+        // What a lost GPU device looks like from here. Without the report, the
+        // slot stays recorded as playing, is never rescheduled, and the tile
+        // stays dead until the app restarts.
+        let opened = Arc::new(AtomicUsize::new(0));
+        let backend = FakeBackend {
+            opened: Arc::clone(&opened),
+            restarts: Arc::new(AtomicUsize::new(0)),
+            seeks: Arc::new(Mutex::new(Vec::new())),
+            fail_on: "never-matches",
+            die_after: Some(2),
+        };
+        let mut service = PlaybackService::new(backend, || {});
+        service.resize(1);
+        service.apply(&SlotPlan { stop: vec![], start: vec![(0, 3)] }, 1, None, source);
+        assert_eq!(service.holding(), [Some(3)]);
+
+        assert!(
+            eventually(|| {
+                service.drain();
+                service.holding() == [None]
+            }),
+            "a dead stream should have freed its slot"
+        );
     }
 
     #[test]

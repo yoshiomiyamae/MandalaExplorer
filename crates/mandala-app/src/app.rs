@@ -1,7 +1,7 @@
 //! The application shell: navigation, the tile grid, and the loop that keeps
 //! thumbnails and playback pointed at whatever is on screen.
 
-use crate::player::PlaybackService;
+use crate::player::{PlaybackService, SlotEvent};
 use crate::thumbs::{Job, ThumbnailService, thumbnail_tier};
 use eframe::egui::{
     self, Align2, Color32, Context, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, TextureHandle,
@@ -362,7 +362,17 @@ impl MandalaApp {
             }
         }
 
-        for decoded in self.player.drain().collect::<Vec<_>>() {
+        for event in self.player.drain() {
+            let decoded = match event {
+                SlotEvent::Frame(decoded) => decoded,
+                // The slot has already been freed; drop the stale video so the
+                // still thumbnail comes back rather than a frozen last frame.
+                SlotEvent::Lost { tile } => {
+                    self.video_textures.remove(&tile);
+                    self.playback.remove(&tile);
+                    continue;
+                }
+            };
             if decoded.generation != self.generation {
                 continue;
             }

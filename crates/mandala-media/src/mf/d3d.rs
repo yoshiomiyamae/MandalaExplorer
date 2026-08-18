@@ -6,7 +6,7 @@
 //! stream: creating one per tile would multiply driver-side memory for no gain.
 
 use anyhow::{Result, anyhow};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
 use windows::Win32::Graphics::Direct3D11::{
@@ -23,8 +23,9 @@ use windows::core::Interface;
 /// pointers themselves are documented as thread-safe under that setting.
 pub struct SharedDevice {
     manager: IMFDXGIDeviceManager,
-    /// Held so the device outlives the manager referencing it.
-    _device: ID3D11Device,
+    /// Held both so the device outlives the manager referencing it, and so its
+    /// removal can be noticed.
+    device: ID3D11Device,
 }
 
 unsafe impl Send for SharedDevice {}
@@ -34,16 +35,44 @@ impl SharedDevice {
     pub fn manager(&self) -> &IMFDXGIDeviceManager {
         &self.manager
     }
+
+    /// Whether the driver still has this device.
+    ///
+    /// Devices are lost for reasons that have nothing to do with this app: a
+    /// KVM switching monitors away, a remote desktop session attaching, a
+    /// driver update, waking from sleep. Media Foundation then quietly falls
+    /// back to software decoding, which reads as the app having become slow
+    /// for no reason.
+    pub fn is_alive(&self) -> bool {
+        unsafe { self.device.GetDeviceRemovedReason().is_ok() }
+    }
 }
 
-/// The process-wide device, or `None` on a machine where one cannot be made.
+/// The device every decoder shares, made on demand and replaced when lost.
 ///
 /// A failure here is not fatal: decoding falls back to software, which is
 /// slower but still correct. Remote desktop sessions and stripped-down VMs are
-/// the usual reasons.
-pub fn shared_device() -> Option<&'static SharedDevice> {
-    static DEVICE: OnceLock<Option<SharedDevice>> = OnceLock::new();
-    DEVICE.get_or_init(|| create_device().ok()).as_ref()
+/// the usual reasons for there being no device at all.
+///
+/// Checked on every call rather than made once, because a device that dies
+/// while the app runs would otherwise keep every later decode on the CPU until
+/// the app was restarted -- with nothing on screen to say why.
+pub fn shared_device() -> Option<Arc<SharedDevice>> {
+    static DEVICE: Mutex<Option<Arc<SharedDevice>>> = Mutex::new(None);
+
+    let mut slot = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(device) = slot.as_ref() {
+        if device.is_alive() {
+            return Some(Arc::clone(device));
+        }
+        // Lost. Dropping it here means the streams still holding one keep it
+        // alive until they notice their own failures and are torn down.
+        *slot = None;
+    }
+
+    let device = Arc::new(create_device().ok()?);
+    *slot = Some(Arc::clone(&device));
+    Some(device)
 }
 
 fn create_device() -> Result<SharedDevice> {
@@ -75,7 +104,7 @@ fn create_device() -> Result<SharedDevice> {
         let manager = manager.ok_or_else(|| anyhow!("MFCreateDXGIDeviceManager returned none"))?;
         manager.ResetDevice(&device, token)?;
 
-        Ok(SharedDevice { manager, _device: device })
+        Ok(SharedDevice { manager, device })
     }
 }
 
@@ -84,13 +113,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_device_is_created_once_and_reused() {
+    fn a_live_device_is_reused_rather_than_remade() {
         // Also the only assertion that this machine can decode on the GPU at
         // all; a None here means every later decode quietly runs on the CPU.
         let first = shared_device();
         let second = shared_device();
         match (first, second) {
-            (Some(a), Some(b)) => assert!(std::ptr::eq(a, b), "device should be shared"),
+            (Some(a), Some(b)) => {
+                assert!(Arc::ptr_eq(&a, &b), "a live device should be handed out again");
+                assert!(a.is_alive());
+            }
             (None, None) => eprintln!("no D3D11 device available; decoding will be software"),
             _ => panic!("shared_device must be consistent between calls"),
         }
