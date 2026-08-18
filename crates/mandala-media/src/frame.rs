@@ -169,8 +169,7 @@ mod tests {
 
     #[test]
     fn frame_carries_its_dimensions_and_timestamp() {
-        let f = Frame::from_packed(&bgra_row(), bgra(8), 2, 1, Duration::from_millis(500))
-            .unwrap();
+        let f = Frame::from_packed(&bgra_row(), bgra(8), 2, 1, Duration::from_millis(500)).unwrap();
         assert_eq!((f.width, f.height), (2, 1));
         assert_eq!(f.rgba.len(), 8);
         assert_eq!(f.timestamp, Duration::from_millis(500));

@@ -394,10 +394,7 @@ impl MandalaApp {
             }
             jobs.push((
                 entry.path.clone(),
-                Job::Duration {
-                    path: entry.path.clone(),
-                    meta_key: Self::metadata_key(entry),
-                },
+                Job::Duration { path: entry.path.clone(), meta_key: Self::metadata_key(entry) },
             ));
         }
         for (path, job) in jobs {
@@ -421,9 +418,8 @@ impl MandalaApp {
 
         // With autoplay off, only the tile under the cursor plays -- which is
         // still the single most useful thing the grid can do.
-        let hovered = self.hovered.filter(|&i| {
-            self.entries.get(i).is_some_and(|e| e.kind.is_playable())
-        });
+        let hovered =
+            self.hovered.filter(|&i| self.entries.get(i).is_some_and(|e| e.kind.is_playable()));
         let wanted = if self.settings.autoplay {
             plan_playback(
                 &candidates,
@@ -533,8 +529,7 @@ impl MandalaApp {
                 ui.checkbox(&mut self.settings.show_labels, "Names");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let videos =
-                        self.entries.iter().filter(|e| e.kind == MediaKind::Video).count();
+                    let videos = self.entries.iter().filter(|e| e.kind == MediaKind::Video).count();
                     ui.label(format!("{} items, {videos} video", self.entries.len()));
                 });
             });
@@ -543,10 +538,7 @@ impl MandalaApp {
 
     fn image_area(&self, tile: Rect) -> Rect {
         let label_room = if self.settings.show_labels { LABEL_HEIGHT } else { 0.0 };
-        Rect::from_min_max(
-            tile.min + Vec2::splat(4.0),
-            tile.max - Vec2::new(4.0, 4.0 + label_room),
-        )
+        Rect::from_min_max(tile.min + Vec2::splat(4.0), tile.max - Vec2::new(4.0, 4.0 + label_room))
     }
 
     fn draw_tile(&self, ui: &Ui, index: usize, rect: Rect, hovered: bool) {
@@ -554,11 +546,8 @@ impl MandalaApp {
         let painter = ui.painter();
         let visuals = ui.visuals();
 
-        let background = if hovered {
-            visuals.widgets.hovered.bg_fill
-        } else {
-            visuals.extreme_bg_color
-        };
+        let background =
+            if hovered { visuals.widgets.hovered.bg_fill } else { visuals.extreme_bg_color };
         painter.rect_filled(rect, CornerRadius::same(6), background);
 
         let image_area = self.image_area(rect);
@@ -657,66 +646,75 @@ impl eframe::App for MandalaApp {
             let target = TileSize::square(self.settings.tile_px);
             let count = self.entries.len();
 
-            egui::ScrollArea::vertical().auto_shrink([false; 2]).show_viewport(ui, |ui, viewport| {
-                // Measured inside the scroll area, where the width already has
-                // the scrollbar taken out of it.
-                let layout = GridLayout::stretched(ui.available_width(), target, GAP, PADDING);
-                let tile = layout.tile();
-                ui.set_height(layout.content_height(count));
-                let origin = ui.min_rect().min;
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show_viewport(
+                ui,
+                |ui, viewport| {
+                    // Measured inside the scroll area, where the width already has
+                    // the scrollbar taken out of it.
+                    let layout = GridLayout::stretched(ui.available_width(), target, GAP, PADDING);
+                    let tile = layout.tile();
+                    ui.set_height(layout.content_height(count));
+                    let origin = ui.min_rect().min;
 
-                self.visible =
-                    layout.visible_indices(viewport.min.y, viewport.height(), count, OVERSCAN_ROWS);
+                    self.visible = layout.visible_indices(
+                        viewport.min.y,
+                        viewport.height(),
+                        count,
+                        OVERSCAN_ROWS,
+                    );
 
-                for index in self.visible.clone() {
-                    let (x, y) = layout.tile_origin(index);
-                    let rect =
-                        Rect::from_min_size(origin + Vec2::new(x, y), Vec2::new(tile.w, tile.h));
-                    let response =
-                        ui.interact(rect, ui.id().with(("tile", index)), Sense::click());
-                    let mut hovering = response.hovered();
-                    if response.double_clicked() {
-                        activated = Some(index);
-                    }
-
-                    // The scrub strip sits on top of the tile, so it is claimed
-                    // after it and hands hover back to the tile -- otherwise
-                    // pointing at the bar would stop the video playing.
-                    if let Some(info) = self.playback.get(&index).copied()
-                        && let Some(duration) = info.duration
-                        && duration > Duration::ZERO
-                    {
-                        let bar = seek_bar_rect(self.image_area(rect));
-                        let bar_response = ui.interact(
-                            bar,
-                            ui.id().with(("seek", index)),
-                            Sense::click_and_drag(),
+                    for index in self.visible.clone() {
+                        let (x, y) = layout.tile_origin(index);
+                        let rect = Rect::from_min_size(
+                            origin + Vec2::new(x, y),
+                            Vec2::new(tile.w, tile.h),
                         );
-                        if bar_response.hovered() {
-                            hovering = true;
+                        let response =
+                            ui.interact(rect, ui.id().with(("tile", index)), Sense::click());
+                        let mut hovering = response.hovered();
+                        if response.double_clicked() {
+                            activated = Some(index);
                         }
-                        if let Some(pointer) = bar_response.interact_pointer_pos() {
-                            hovering = true;
-                            seek_request =
-                                Some((index, seek_position(bar, pointer.x, duration)));
+
+                        // The scrub strip sits on top of the tile, so it is claimed
+                        // after it and hands hover back to the tile -- otherwise
+                        // pointing at the bar would stop the video playing.
+                        if let Some(info) = self.playback.get(&index).copied()
+                            && let Some(duration) = info.duration
+                            && duration > Duration::ZERO
+                        {
+                            let bar = seek_bar_rect(self.image_area(rect));
+                            let bar_response = ui.interact(
+                                bar,
+                                ui.id().with(("seek", index)),
+                                Sense::click_and_drag(),
+                            );
+                            if bar_response.hovered() {
+                                hovering = true;
+                            }
+                            if let Some(pointer) = bar_response.interact_pointer_pos() {
+                                hovering = true;
+                                seek_request =
+                                    Some((index, seek_position(bar, pointer.x, duration)));
+                            }
                         }
+
+                        if hovering {
+                            hovered_now = Some(index);
+                        }
+                        self.draw_tile(ui, index, rect, hovering);
                     }
 
-                    if hovering {
-                        hovered_now = Some(index);
-                    }
-                    self.draw_tile(ui, index, rect, hovering);
-                }
-
-                let center = viewport.min.y + viewport.height() / 2.0;
-                let settled = self.settle.update(viewport.min.y, Instant::now());
-                self.hovered = hovered_now;
-                self.retier_thumbnails();
-                self.request_visible_thumbnails();
-                self.request_missing_durations();
-                self.schedule_playback(&layout, center, settled);
-                self.trim_textures(&layout);
-            });
+                    let center = viewport.min.y + viewport.height() / 2.0;
+                    let settled = self.settle.update(viewport.min.y, Instant::now());
+                    self.hovered = hovered_now;
+                    self.retier_thumbnails();
+                    self.request_visible_thumbnails();
+                    self.request_missing_durations();
+                    self.schedule_playback(&layout, center, settled);
+                    self.trim_textures(&layout);
+                },
+            );
         });
 
         // Re-sorting moves every tile, so it happens once the frame is drawn
@@ -737,18 +735,16 @@ impl eframe::App for MandalaApp {
 /// Whether any entry sits somewhere other than where `positions` had it.
 fn order_changed(entries: &[Entry], positions: &HashMap<PathBuf, usize>) -> bool {
     entries.len() != positions.len()
-        || entries.iter().enumerate().any(|(index, entry)| {
-            positions.get(&entry.path) != Some(&index)
-        })
+        || entries
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| positions.get(&entry.path) != Some(&index))
 }
 
 /// The strip along the bottom of a tile that scrubs playback.
 fn seek_bar_rect(image_area: Rect) -> Rect {
     let height = SEEK_BAR_HEIGHT.min(image_area.height());
-    Rect::from_min_max(
-        Pos2::new(image_area.min.x, image_area.max.y - height),
-        image_area.max,
-    )
+    Rect::from_min_max(Pos2::new(image_area.min.x, image_area.max.y - height), image_area.max)
 }
 
 /// Position in a clip for a pointer sitting at `x` over the bar.
@@ -767,10 +763,8 @@ fn draw_seek_bar(
     painter.rect_filled(bar, CornerRadius::same(2), Color32::from_black_alpha(160));
     let fraction =
         (position.as_secs_f32() / duration.as_secs_f32().max(f32::EPSILON)).clamp(0.0, 1.0);
-    let played = Rect::from_min_max(
-        bar.min,
-        Pos2::new(bar.min.x + bar.width() * fraction, bar.max.y),
-    );
+    let played =
+        Rect::from_min_max(bar.min, Pos2::new(bar.min.x + bar.width() * fraction, bar.max.y));
     painter.rect_filled(played, CornerRadius::same(2), visuals.selection.bg_fill);
 }
 
@@ -1046,5 +1040,4 @@ mod tests {
         settle.update(100.0, start);
         assert!(settle.update(100.2, start + SCROLL_SETTLE));
     }
-
 }

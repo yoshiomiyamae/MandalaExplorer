@@ -8,9 +8,7 @@
 
 pub mod d3d;
 
-use crate::backend::{
-    Advance, MediaBackend, VideoStream, VideoThumbnail, thumbnail_timestamp,
-};
+use crate::backend::{Advance, MediaBackend, VideoStream, VideoThumbnail, thumbnail_timestamp};
 use crate::frame::{Frame, Layout};
 use crate::sizing::fit_within;
 use anyhow::{Context, Result, anyhow};
@@ -276,8 +274,7 @@ impl MfStream {
                     bottom_up: pitch < 0,
                     swap_rb: self.swap_rb,
                 };
-                let frame =
-                    Frame::from_packed(bytes, layout, self.size.0, self.size.1, timestamp);
+                let frame = Frame::from_packed(bytes, layout, self.size.0, self.size.1, timestamp);
                 let _ = buffer2d.Unlock2D();
                 return frame;
             }
@@ -374,7 +371,11 @@ impl VideoStream for MfStream {
 /// Returns whether frames will need red and blue exchanged on the CPU. Asking
 /// for RGBA first is worth it: at large tile sizes the swap is hundreds of
 /// megabytes a second of pointless work.
-unsafe fn negotiate_output(reader: &IMFSourceReader, stream: u32, size: (u32, u32)) -> Result<bool> {
+unsafe fn negotiate_output(
+    reader: &IMFSourceReader,
+    stream: u32,
+    size: (u32, u32),
+) -> Result<bool> {
     // (subtype, whether its byte order needs swapping to reach RGBA)
     const CANDIDATES: [(GUID, bool); 2] =
         [(MF_VIDEO_FORMAT_ABGR32, false), (MFVideoFormat_RGB32, true)];

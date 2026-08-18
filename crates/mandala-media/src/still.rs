@@ -28,9 +28,7 @@ mod tests {
 
     fn write_png(dir: &Path, name: &str, w: u32, h: u32) -> std::path::PathBuf {
         let path = dir.join(name);
-        image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255]))
-            .save(&path)
-            .unwrap();
+        image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255])).save(&path).unwrap();
         path
     }
 

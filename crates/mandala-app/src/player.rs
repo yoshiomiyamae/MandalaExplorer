@@ -58,7 +58,10 @@ pub struct PlaybackService {
 }
 
 impl PlaybackService {
-    pub fn new<B: MediaBackend + Clone>(backend: B, on_frame: impl Fn() + Send + Clone + 'static) -> Self {
+    pub fn new<B: MediaBackend + Clone>(
+        backend: B,
+        on_frame: impl Fn() + Send + Clone + 'static,
+    ) -> Self {
         let (frame_sink, frames) = unbounded();
         let spawn = Box::new(move |slot: usize, commands, sink| {
             let backend = backend.clone();
@@ -89,12 +92,7 @@ impl PlaybackService {
         while self.slots.len() < count {
             let (commands, receiver) = unbounded();
             (self.spawn)(self.slots.len(), receiver, self.frame_sink.clone());
-            self.slots.push(SlotHandle {
-                commands,
-                worker: None,
-                holding: None,
-                fps: AMBIENT_FPS,
-            });
+            self.slots.push(SlotHandle { commands, worker: None, holding: None, fps: AMBIENT_FPS });
         }
     }
 

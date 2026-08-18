@@ -53,8 +53,7 @@ pub fn scan_dir(dir: &Path) -> io::Result<Vec<Entry>> {
         });
     }
 
-    entries
-        .sort_by(|a, b| b.is_dir().cmp(&a.is_dir()).then_with(|| natural_cmp(&a.name, &b.name)));
+    entries.sort_by(|a, b| b.is_dir().cmp(&a.is_dir()).then_with(|| natural_cmp(&a.name, &b.name)));
     Ok(entries)
 }
 

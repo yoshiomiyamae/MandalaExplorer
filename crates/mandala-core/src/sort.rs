@@ -102,9 +102,7 @@ where
     match sort.key {
         SortKey::Name => sort.order.apply(natural_cmp(&a.name, &b.name)),
         SortKey::Kind => sort.order.apply(
-            kind_rank(a.kind)
-                .cmp(&kind_rank(b.kind))
-                .then_with(|| extension(a).cmp(&extension(b))),
+            kind_rank(a.kind).cmp(&kind_rank(b.kind)).then_with(|| extension(a).cmp(&extension(b))),
         ),
         SortKey::Size => sort.order.apply(a.len.cmp(&b.len)),
         SortKey::Modified => sort.order.apply(a.modified.cmp(&b.modified)),
@@ -191,8 +189,7 @@ mod tests {
 
     #[test]
     fn sorts_by_size() {
-        let entries =
-            vec![entry("m.png", 500, 1), entry("s.png", 100, 1), entry("l.png", 900, 1)];
+        let entries = vec![entry("m.png", 500, 1), entry("s.png", 100, 1), entry("l.png", 900, 1)];
         assert_eq!(
             names(&sorted(entries.clone(), SortKey::Size, SortOrder::Ascending)),
             vec!["s.png", "m.png", "l.png"]
@@ -205,7 +202,8 @@ mod tests {
 
     #[test]
     fn sorts_by_modification_time() {
-        let entries = vec![entry("mid.png", 1, 50), entry("old.png", 1, 1), entry("new.png", 1, 99)];
+        let entries =
+            vec![entry("mid.png", 1, 50), entry("old.png", 1, 1), entry("new.png", 1, 99)];
         assert_eq!(
             names(&sorted(entries.clone(), SortKey::Modified, SortOrder::Ascending)),
             vec!["old.png", "mid.png", "new.png"]
@@ -281,7 +279,11 @@ mod tests {
         };
 
         let mut up = entries.clone();
-        sort_entries(&mut up, Sort { key: SortKey::Duration, order: SortOrder::Ascending }, lengths);
+        sort_entries(
+            &mut up,
+            Sort { key: SortKey::Duration, order: SortOrder::Ascending },
+            lengths,
+        );
         assert_eq!(names(&up), vec!["short.mp4", "long.mp4"]);
 
         let mut down = entries;
@@ -299,9 +301,7 @@ mod tests {
         // no length known. Reversing must not float either to the top.
         let entries =
             vec![entry("still.png", 1, 1), entry("clip.mp4", 1, 1), entry("unprobed.mp4", 1, 1)];
-        let lengths = |e: &Entry| {
-            (e.name == "clip.mp4").then_some(Duration::from_secs(30))
-        };
+        let lengths = |e: &Entry| (e.name == "clip.mp4").then_some(Duration::from_secs(30));
 
         for order in [SortOrder::Ascending, SortOrder::Descending] {
             let mut got = entries.clone();

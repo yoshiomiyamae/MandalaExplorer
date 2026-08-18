@@ -1,4 +1,3 @@
-
 use std::path::Path;
 
 /// What an entry is, decided from its extension.
@@ -43,10 +42,7 @@ impl MediaKind {
     }
 
     pub fn from_path(path: &Path) -> Self {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(Self::from_extension)
-            .unwrap_or(Self::Other)
+        path.extension().and_then(|e| e.to_str()).map(Self::from_extension).unwrap_or(Self::Other)
     }
 
     /// Whether this can play inline inside its tile.

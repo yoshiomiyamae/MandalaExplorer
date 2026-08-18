@@ -253,7 +253,12 @@ fn produce(
 fn load_cached(path: &Path) -> Result<Frame> {
     let image = image::ImageReader::open(path)?.with_guessed_format()?.decode()?;
     let (w, h) = (image.width(), image.height());
-    Ok(Frame { width: w, height: h, rgba: image.into_rgba8().into_raw(), timestamp: Duration::ZERO })
+    Ok(Frame {
+        width: w,
+        height: h,
+        rgba: image.into_rgba8().into_raw(),
+        timestamp: Duration::ZERO,
+    })
 }
 
 fn store_cached(path: &Path, frame: &Frame) -> Result<()> {
@@ -389,7 +394,10 @@ mod tests {
         let loaded = load_cached(&path).unwrap();
         assert_eq!((loaded.width, loaded.height), (4, 2));
         assert_eq!(loaded.rgba.len(), 4 * 2 * 4);
-        assert!(loaded.rgba.chunks_exact(4).all(|p| p[3] == 255), "reloaded alpha should be opaque");
+        assert!(
+            loaded.rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "reloaded alpha should be opaque"
+        );
     }
 
     #[test]

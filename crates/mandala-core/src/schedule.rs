@@ -1,4 +1,3 @@
-
 //! Budgeting for inline playback.
 //!
 //! Playing every visible tile exhausts decoder memory and GPU decode slots, so
@@ -71,9 +70,7 @@ mod tests {
     use super::*;
 
     fn candidates() -> Vec<PlaybackCandidate> {
-        (0..5)
-            .map(|i| PlaybackCandidate { index: i, center_y: i as f32 * 100.0 })
-            .collect()
+        (0..5).map(|i| PlaybackCandidate { index: i, center_y: i as f32 * 100.0 }).collect()
     }
 
     const NO_HYSTERESIS: ScheduleParams = ScheduleParams { budget: 3, hysteresis: 0.0 };

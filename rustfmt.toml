@@ -1,0 +1,4 @@
+# The codebase already reads this way: one line where one line fits, rather
+# than breaking calls and struct literals apart at a narrower threshold than
+# the line limit. Formalised so `cargo fmt --check` can run in CI.
+use_small_heuristics = "Max"

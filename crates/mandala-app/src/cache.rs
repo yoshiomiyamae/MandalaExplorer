@@ -48,8 +48,7 @@ struct CacheFile {
 pub fn sweep(dir: &Path, limit: u64) -> io::Result<SweepReport> {
     let mut files = collect(dir)?;
     let mut total: u64 = files.iter().map(|f| f.size).sum();
-    let mut report =
-        SweepReport { files: files.len(), removed: 0, freed: 0, remaining: total };
+    let mut report = SweepReport { files: files.len(), removed: 0, freed: 0, remaining: total };
     if total <= limit {
         return Ok(report);
     }

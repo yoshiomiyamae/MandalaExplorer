@@ -1,4 +1,3 @@
-
 //! Stable identity for a cached thumbnail.
 //!
 //! Thumbnails live on disk between runs, so the key has to change whenever the

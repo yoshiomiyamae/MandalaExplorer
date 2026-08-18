@@ -295,10 +295,7 @@ fn opening_and_dropping_videos_does_not_leak_threads() {
 
     // Some slack for pool threads that linger briefly, but 25 opens must not
     // leave 25 threads behind.
-    assert!(
-        after <= before + 8,
-        "threads grew from {before} to {after} over 25 open/drop cycles"
-    );
+    assert!(after <= before + 8, "threads grew from {before} to {after} over 25 open/drop cycles");
 }
 
 #[test]
