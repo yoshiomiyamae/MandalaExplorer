@@ -27,6 +27,15 @@ impl CacheKey {
         Self(hasher.finalize().to_hex()[..KEY_BYTES * 2].to_owned())
     }
 
+    /// Key for metadata that has nothing to do with thumbnail size, such as a
+    /// running time. Kept separate so changing the tile size does not throw
+    /// away facts about the file that never depended on it.
+    pub fn metadata(path: &Path, mtime_unix_nanos: i128, len: u64) -> Self {
+        // Zero is not a real target size, so this cannot collide with a
+        // thumbnail key for the same file.
+        Self::new(path, mtime_unix_nanos, len, 0)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -65,6 +74,25 @@ mod tests {
         assert_ne!(base, key("a/b.mp4", 9, 2, 256), "mtime must matter");
         assert_ne!(base, key("a/b.mp4", 1, 9, 256), "size must matter");
         assert_ne!(base, key("a/b.mp4", 1, 2, 512), "target size must matter");
+    }
+
+    #[test]
+    fn a_metadata_key_is_independent_of_thumbnail_size() {
+        let path = Path::new("a/b.mp4");
+        let first = CacheKey::metadata(path, 1, 2);
+        assert_eq!(first, CacheKey::metadata(path, 1, 2));
+        // It must not collide with any thumbnail key for the same file.
+        for px in [128, 256, 512, 1024, 2048] {
+            assert_ne!(first, key("a/b.mp4", 1, 2, px));
+        }
+    }
+
+    #[test]
+    fn a_metadata_key_still_tracks_the_file_itself() {
+        let base = CacheKey::metadata(Path::new("a/b.mp4"), 1, 2);
+        assert_ne!(base, CacheKey::metadata(Path::new("a/c.mp4"), 1, 2));
+        assert_ne!(base, CacheKey::metadata(Path::new("a/b.mp4"), 9, 2));
+        assert_ne!(base, CacheKey::metadata(Path::new("a/b.mp4"), 1, 9));
     }
 
     #[test]

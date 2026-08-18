@@ -15,6 +15,6 @@ pub mod mf;
 #[cfg(windows)]
 pub use mf::MediaFoundation;
 
-pub use backend::{Advance, MediaBackend, VideoStream};
+pub use backend::{Advance, MediaBackend, VideoStream, VideoThumbnail};
 pub use frame::Frame;
 pub use sizing::fit_within;

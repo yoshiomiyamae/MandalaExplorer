@@ -27,11 +27,18 @@ With no argument it opens your Pictures folder.
 | Jump to a path | type it in the path box, Enter |
 | Thumbnail size | the size slider, or Ctrl and the wheel |
 | Scrub a video | point at its tile, drag the strip along the bottom |
+| Reorder | pick a key next to Sort, click the arrow to reverse |
 | How many videos play at once | the "at once" slider |
 | Play only what you point at | untick Autoplay |
 
-Plain wheel scrolls, so resizing needs Ctrl held. Tile size and the playback
-count are remembered between runs, along with the window geometry.
+Plain wheel scrolls, so resizing needs Ctrl held. Tile size, playback count and
+sort order are remembered between runs, along with the window geometry.
+
+Sorting works on name, type, size, modification time, or running length, each
+either way round. Folders stay at the top whichever key and direction is
+chosen -- a folder is somewhere to go, not something to compare against the
+files beside it, and reversing "largest first" should not bury the way back out
+at the bottom of the grid.
 
 ## How it is put together
 
@@ -66,6 +73,13 @@ out to the tiles that most deserve them: whatever you are pointing at first,
 then whatever is nearest the middle of the screen. Tiles that keep their slot
 across a scroll keep playing without restarting, and video is decoded no larger
 than the tile can actually show.
+
+**Length is learned once and kept.** A running time means opening the file, so
+it is cached beside the thumbnail -- under a key that deliberately excludes the
+size tier, since how long a video runs for has nothing to do with the size it
+was last drawn at. Anything already thumbnailed knows its length for free, and
+sorting by length only probes the files it still has to ask about, a few per
+frame so one enormous folder cannot flood the queue.
 
 **The cache is capped.** Thumbnails live in
 `%LOCALAPPDATA%\mandala\thumbnails`, sharded by hash so no directory holds a

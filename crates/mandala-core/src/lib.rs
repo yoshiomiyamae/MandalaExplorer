@@ -9,9 +9,11 @@ pub mod kind;
 pub mod layout;
 pub mod scan;
 pub mod schedule;
+pub mod sort;
 
 pub use cache_key::CacheKey;
 pub use kind::MediaKind;
 pub use layout::{GridLayout, TileSize};
 pub use scan::{Entry, scan_dir};
 pub use schedule::{PlaybackCandidate, plan_playback};
+pub use sort::{Sort, SortKey, SortOrder, sort_entries};

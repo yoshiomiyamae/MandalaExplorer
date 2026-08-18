@@ -1,11 +1,11 @@
-//! Background thumbnail production.
+//! Background thumbnail and metadata production.
 //!
-//! Thumbnails are produced off the UI thread, cached on disk between runs, and
+//! Work happens off the UI thread, is cached on disk between runs, and is
 //! served newest-request-first: when someone flings the scrollbar, the tiles
 //! they are looking at now matter far more than the ones they flew past.
 
 use crate::cache::{CACHE_LIMIT_BYTES, mark_used, sweep};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use mandala_core::{CacheKey, MediaKind};
 use mandala_media::{Frame, MediaBackend};
@@ -27,19 +27,35 @@ pub fn thumbnail_tier(tile_px: u32) -> u32 {
     TIERS.iter().copied().find(|&t| t >= tile_px).unwrap_or(*TIERS.last().unwrap())
 }
 
-/// A request to produce one thumbnail.
+/// A piece of work for the pool.
 #[derive(Debug, Clone)]
-pub struct ThumbnailRequest {
-    pub key: CacheKey,
-    pub path: PathBuf,
-    pub kind: MediaKind,
-    pub tier: u32,
+pub enum Job {
+    /// A thumbnail, plus whatever else opening the file happens to reveal.
+    Thumbnail {
+        path: PathBuf,
+        kind: MediaKind,
+        key: CacheKey,
+        /// Size-independent key, for facts like running time.
+        meta_key: CacheKey,
+        tier: u32,
+    },
+    /// Only the running time, for a video that is not on screen.
+    ///
+    /// Sorting by length has to know about files nobody has looked at yet, and
+    /// reading a container header is far cheaper than decoding a poster frame.
+    Duration { path: PathBuf, meta_key: CacheKey },
 }
 
-/// A finished thumbnail, or the failure that stops it being asked for again.
-pub struct ThumbnailResult {
-    pub key: CacheKey,
-    pub outcome: Result<Frame>,
+/// What a worker found.
+///
+/// Results are keyed by path rather than by cache key, so they still find their
+/// tile if the thumbnail size changed while the work was in flight.
+pub struct JobDone {
+    pub path: PathBuf,
+    /// Present only for thumbnail jobs. The error is kept so the UI can stop
+    /// asking for a thumbnail that cannot be made.
+    pub thumbnail: Option<Result<Frame>>,
+    pub duration: Option<Duration>,
 }
 
 /// Bounds the backlog. Anything older than this many requests is stale enough
@@ -52,28 +68,28 @@ struct Queue {
 }
 
 struct QueueInner {
-    pending: VecDeque<ThumbnailRequest>,
+    pending: VecDeque<Job>,
     shutdown: bool,
 }
 
 impl Queue {
-    fn push(&self, request: ThumbnailRequest) {
+    fn push(&self, job: Job) {
         let mut inner = self.inner.lock().unwrap();
         // Newest first: the tiles on screen right now are at the front.
-        inner.pending.push_front(request);
+        inner.pending.push_front(job);
         inner.pending.truncate(MAX_PENDING);
         drop(inner);
         self.wake.notify_one();
     }
 
-    fn pop(&self) -> Option<ThumbnailRequest> {
+    fn pop(&self) -> Option<Job> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if inner.shutdown {
                 return None;
             }
-            if let Some(request) = inner.pending.pop_front() {
-                return Some(request);
+            if let Some(job) = inner.pending.pop_front() {
+                return Some(job);
             }
             inner = self.wake.wait(inner).unwrap();
         }
@@ -90,24 +106,21 @@ impl Queue {
 
 pub struct ThumbnailService {
     queue: Arc<Queue>,
-    results: Receiver<ThumbnailResult>,
+    results: Receiver<JobDone>,
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl ThumbnailService {
-    pub fn new<B: MediaBackend + Clone>(backend: B, on_ready: impl Fn() + Send + Clone + 'static) -> Self {
+    pub fn new<B: MediaBackend + Clone>(
+        backend: B,
+        on_ready: impl Fn() + Send + Clone + 'static,
+    ) -> Self {
         let queue = Arc::new(Queue {
             inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
             wake: Condvar::new(),
         });
         let (tx, results) = unbounded();
         let cache_dir = cache_dir();
-
-        // Decoding a video poster frame is heavy, so a couple of threads short
-        // of the core count keeps the UI thread responsive while a folder of
-        // videos is being indexed.
-        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let worker_count = parallelism.saturating_sub(2).clamp(2, 8);
 
         // Sweeping walks the whole cache directory, so it happens once on a
         // thread of its own rather than blocking the first folder from loading.
@@ -126,20 +139,25 @@ impl ThumbnailService {
             })
             .ok();
 
+        // Decoding a video poster frame is heavy, so a couple of threads short
+        // of the core count keeps the UI thread responsive while a folder of
+        // videos is being indexed.
+        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let worker_count = parallelism.saturating_sub(2).clamp(2, 8);
+
         let workers = (0..worker_count)
             .map(|_| {
                 let queue = Arc::clone(&queue);
-                let tx: Sender<ThumbnailResult> = tx.clone();
+                let tx: Sender<JobDone> = tx.clone();
                 let backend = backend.clone();
                 let cache_dir = cache_dir.clone();
                 let on_ready = on_ready.clone();
                 std::thread::Builder::new()
                     .name("mandala-thumbs".into())
                     .spawn(move || {
-                        while let Some(request) = queue.pop() {
-                            let key = request.key.clone();
-                            let outcome = produce(&request, &cache_dir, &backend);
-                            if tx.send(ThumbnailResult { key, outcome }).is_err() {
+                        while let Some(job) = queue.pop() {
+                            let done = run(&job, &cache_dir, &backend);
+                            if tx.send(done).is_err() {
                                 break;
                             }
                             on_ready();
@@ -152,14 +170,14 @@ impl ThumbnailService {
         Self { queue, results, workers }
     }
 
-    /// Queues a thumbnail. Callers are expected to track what they have already
-    /// asked for; this does not deduplicate.
-    pub fn request(&self, request: ThumbnailRequest) {
-        self.queue.push(request);
+    /// Queues work. Callers are expected to track what they have already asked
+    /// for; this does not deduplicate.
+    pub fn request(&self, job: Job) {
+        self.queue.push(job);
     }
 
     /// Takes whatever finished since the last call.
-    pub fn drain(&self) -> impl Iterator<Item = ThumbnailResult> + '_ {
+    pub fn drain(&self) -> impl Iterator<Item = JobDone> + '_ {
         self.results.try_iter()
     }
 }
@@ -173,50 +191,113 @@ impl Drop for ThumbnailService {
     }
 }
 
-/// Loads from the disk cache, or produces and caches it.
-fn produce(request: &ThumbnailRequest, cache_dir: &Path, backend: &impl MediaBackend) -> Result<Frame> {
-    let cached = cache_dir.join(request.key.relative_path("jpg"));
+fn run(job: &Job, cache_dir: &Path, backend: &impl MediaBackend) -> JobDone {
+    match job {
+        Job::Duration { path, meta_key } => {
+            let duration = load_duration(cache_dir, meta_key).or_else(|| {
+                let probed = backend.probe_duration(path).ok().flatten();
+                if let Some(duration) = probed {
+                    let _ = store_duration(cache_dir, meta_key, duration);
+                }
+                probed
+            });
+            JobDone { path: path.clone(), thumbnail: None, duration }
+        }
+        Job::Thumbnail { path, kind, key, meta_key, tier } => {
+            let (thumbnail, duration) =
+                produce(path, *kind, key, meta_key, *tier, cache_dir, backend);
+            JobDone { path: path.clone(), thumbnail: Some(thumbnail), duration }
+        }
+    }
+}
+
+/// Loads a thumbnail from the disk cache, or makes one and caches it.
+fn produce(
+    path: &Path,
+    kind: MediaKind,
+    key: &CacheKey,
+    meta_key: &CacheKey,
+    tier: u32,
+    cache_dir: &Path,
+    backend: &impl MediaBackend,
+) -> (Result<Frame>, Option<Duration>) {
+    let cached = cache_dir.join(key.relative_path("jpg"));
     if let Ok(frame) = load_cached(&cached) {
         // Records the hit, so eviction can tell live thumbnails from dead ones.
         mark_used(&cached);
-        return Ok(frame);
+        // The running time was stored separately and outlives any one tier.
+        return (Ok(frame), load_duration(cache_dir, meta_key));
     }
 
-    let max = (request.tier, request.tier);
-    let frame = match request.kind {
-        MediaKind::Image => mandala_media::still::load_thumbnail(&request.path, max)?,
-        MediaKind::Video => backend.video_thumbnail(&request.path, max)?,
-        other => bail!("{other:?} has no thumbnail"),
+    let max = (tier, tier);
+    let (frame, duration) = match kind {
+        MediaKind::Image => match mandala_media::still::load_thumbnail(path, max) {
+            Ok(frame) => (frame, None),
+            Err(e) => return (Err(e), None),
+        },
+        MediaKind::Video => match backend.video_thumbnail(path, max) {
+            Ok(thumbnail) => (thumbnail.frame, thumbnail.duration),
+            Err(e) => return (Err(e), None),
+        },
+        other => return (Err(anyhow!("{other:?} has no thumbnail")), None),
     };
 
-    // A cache miss is not worth failing the request over.
+    // Failing to cache is not worth failing the request over.
     let _ = store_cached(&cached, &frame);
-    Ok(frame)
+    if let Some(duration) = duration {
+        let _ = store_duration(cache_dir, meta_key, duration);
+    }
+    (Ok(frame), duration)
 }
 
 fn load_cached(path: &Path) -> Result<Frame> {
     let image = image::ImageReader::open(path)?.with_guessed_format()?.decode()?;
     let (w, h) = (image.width(), image.height());
-    Ok(Frame {
-        width: w,
-        height: h,
-        rgba: image.into_rgba8().into_raw(),
-        timestamp: Duration::ZERO,
-    })
+    Ok(Frame { width: w, height: h, rgba: image.into_rgba8().into_raw(), timestamp: Duration::ZERO })
 }
 
 fn store_cached(path: &Path, frame: &Frame) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let rgb = flatten_onto_white(frame);
     let buffer = image::RgbImage::from_raw(frame.width, frame.height, rgb)
         .context("thumbnail dimensions do not match its pixels")?;
+    write_atomically(path, |temporary| {
+        image::DynamicImage::ImageRgb8(buffer)
+            .save_with_format(temporary, image::ImageFormat::Jpeg)
+            .map_err(Into::into)
+    })
+}
 
-    // Written to a temporary name and renamed, so a crash mid-write cannot
-    // leave a truncated JPEG that every later run then fails to decode.
+/// Where a running time is cached.
+///
+/// Deliberately not under the thumbnail key: how long a video runs for has
+/// nothing to do with the size it was last drawn at.
+fn duration_path(cache_dir: &Path, meta_key: &CacheKey) -> PathBuf {
+    cache_dir.join(meta_key.relative_path("ms"))
+}
+
+fn store_duration(cache_dir: &Path, meta_key: &CacheKey, duration: Duration) -> Result<()> {
+    let path = duration_path(cache_dir, meta_key);
+    write_atomically(&path, |temporary| {
+        std::fs::write(temporary, duration.as_millis().to_string()).map_err(Into::into)
+    })
+}
+
+fn load_duration(cache_dir: &Path, meta_key: &CacheKey) -> Option<Duration> {
+    let path = duration_path(cache_dir, meta_key);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let millis: u64 = text.trim().parse().ok()?;
+    mark_used(&path);
+    Some(Duration::from_millis(millis))
+}
+
+/// Writes through a temporary name, so a crash mid-write cannot leave a
+/// truncated file that every later run then fails to read.
+fn write_atomically(path: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let temporary = path.with_extension("tmp");
-    image::DynamicImage::ImageRgb8(buffer).save_with_format(&temporary, image::ImageFormat::Jpeg)?;
+    write(&temporary)?;
     std::fs::rename(&temporary, path)?;
     Ok(())
 }
@@ -241,6 +322,20 @@ fn cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(seed: i128) -> CacheKey {
+        CacheKey::new(Path::new("a"), seed, 0, 128)
+    }
+
+    fn thumbnail_job(seed: i128) -> Job {
+        Job::Thumbnail {
+            path: PathBuf::from("a"),
+            kind: MediaKind::Image,
+            key: key(seed),
+            meta_key: CacheKey::metadata(Path::new("a"), seed, 0),
+            tier: 128,
+        }
+    }
 
     #[test]
     fn tiers_round_up_to_the_next_size() {
@@ -270,23 +365,15 @@ mod tests {
 
     #[test]
     fn transparent_pixels_flatten_to_white() {
-        let frame = Frame {
-            width: 1,
-            height: 1,
-            rgba: vec![10, 20, 30, 0],
-            timestamp: Duration::ZERO,
-        };
+        let frame =
+            Frame { width: 1, height: 1, rgba: vec![10, 20, 30, 0], timestamp: Duration::ZERO };
         assert_eq!(flatten_onto_white(&frame), vec![255, 255, 255]);
     }
 
     #[test]
     fn half_transparent_pixels_land_between_the_colour_and_white() {
-        let frame = Frame {
-            width: 1,
-            height: 1,
-            rgba: vec![0, 0, 0, 128],
-            timestamp: Duration::ZERO,
-        };
+        let frame =
+            Frame { width: 1, height: 1, rgba: vec![0, 0, 0, 128], timestamp: Duration::ZERO };
         let got = flatten_onto_white(&frame);
         assert!(got.iter().all(|&c| (125..=130).contains(&c)), "got {got:?}");
     }
@@ -295,12 +382,8 @@ mod tests {
     fn a_stored_thumbnail_reloads_at_the_same_size() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ab").join("thumb.jpg");
-        let frame = Frame {
-            width: 4,
-            height: 2,
-            rgba: vec![200; 4 * 2 * 4],
-            timestamp: Duration::ZERO,
-        };
+        let frame =
+            Frame { width: 4, height: 2, rgba: vec![200; 4 * 2 * 4], timestamp: Duration::ZERO };
         store_cached(&path, &frame).unwrap();
 
         let loaded = load_cached(&path).unwrap();
@@ -315,22 +398,56 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_duration_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = CacheKey::metadata(Path::new("clip.mp4"), 1, 2);
+        store_duration(dir.path(), &meta, Duration::from_millis(90_500)).unwrap();
+        assert_eq!(load_duration(dir.path(), &meta), Some(Duration::from_millis(90_500)));
+    }
+
+    #[test]
+    fn a_duration_that_was_never_stored_reads_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = CacheKey::metadata(Path::new("clip.mp4"), 1, 2);
+        assert_eq!(load_duration(dir.path(), &meta), None);
+    }
+
+    #[test]
+    fn a_corrupt_duration_file_reads_as_unknown_rather_than_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = CacheKey::metadata(Path::new("clip.mp4"), 1, 2);
+        let path = duration_path(dir.path(), &meta);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a number").unwrap();
+        assert_eq!(load_duration(dir.path(), &meta), None);
+    }
+
+    #[test]
+    fn a_duration_is_found_again_whatever_the_thumbnail_size() {
+        // The point of a separate metadata key: resizing tiles must not throw
+        // away running times, which never depended on the size.
+        let dir = tempfile::tempdir().unwrap();
+        let stored = CacheKey::metadata(Path::new("clip.mp4"), 1, 2);
+        store_duration(dir.path(), &stored, Duration::from_secs(42)).unwrap();
+
+        let looked_up_later = CacheKey::metadata(Path::new("clip.mp4"), 1, 2);
+        assert_eq!(load_duration(dir.path(), &looked_up_later), Some(Duration::from_secs(42)));
+    }
+
+    #[test]
     fn the_queue_serves_the_newest_request_first() {
         let queue = Queue {
             inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
             wake: Condvar::new(),
         };
-        for i in 0..3u32 {
-            queue.push(ThumbnailRequest {
-                key: CacheKey::new(Path::new("a"), i as i128, 0, 128),
-                path: PathBuf::from("a"),
-                kind: MediaKind::Image,
-                tier: 128,
-            });
+        for i in 0..3i128 {
+            queue.push(thumbnail_job(i));
         }
         // The last one pushed is the one on screen now.
-        let first = queue.pop().unwrap();
-        assert_eq!(first.key, CacheKey::new(Path::new("a"), 2, 0, 128));
+        match queue.pop().unwrap() {
+            Job::Thumbnail { key: got, .. } => assert_eq!(got, key(2)),
+            other => panic!("expected a thumbnail job, got {other:?}"),
+        }
     }
 
     #[test]
@@ -339,13 +456,8 @@ mod tests {
             inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
             wake: Condvar::new(),
         };
-        for i in 0..(MAX_PENDING + 10) {
-            queue.push(ThumbnailRequest {
-                key: CacheKey::new(Path::new("a"), i as i128, 0, 128),
-                path: PathBuf::from("a"),
-                kind: MediaKind::Image,
-                tier: 128,
-            });
+        for i in 0..(MAX_PENDING as i128 + 10) {
+            queue.push(thumbnail_job(i));
         }
         assert_eq!(queue.inner.lock().unwrap().pending.len(), MAX_PENDING);
     }
@@ -356,12 +468,7 @@ mod tests {
             inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
             wake: Condvar::new(),
         };
-        queue.push(ThumbnailRequest {
-            key: CacheKey::new(Path::new("a"), 0, 0, 128),
-            path: PathBuf::from("a"),
-            kind: MediaKind::Image,
-            tier: 128,
-        });
+        queue.push(thumbnail_job(0));
         queue.shutdown();
         assert!(queue.pop().is_none());
     }

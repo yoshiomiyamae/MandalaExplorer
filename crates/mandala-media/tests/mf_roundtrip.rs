@@ -230,7 +230,7 @@ fn reports_the_clip_duration() {
 fn produces_a_poster_frame_for_a_thumbnail() {
     let Some(f) = fixture() else { return };
     let backend = MediaFoundation::new().unwrap();
-    let frame = backend.video_thumbnail(&f.path, (128, 128)).unwrap();
+    let frame = backend.video_thumbnail(&f.path, (128, 128)).unwrap().frame;
     assert_eq!((frame.width, frame.height), (128, 96));
     assert!(is_reddish(pixel(&frame, 64, 24)), "poster frame lost its colours");
 }
@@ -381,4 +381,39 @@ fn seeking_past_the_end_does_not_wedge_the_stream() {
         panic!("stream did not recover after seeking past the end");
     };
     assert!(frame.timestamp < Duration::from_millis(200));
+}
+
+#[test]
+fn a_thumbnail_reports_the_running_time_it_learned() {
+    let Some(f) = fixture() else { return };
+    let backend = MediaFoundation::new().unwrap();
+    let thumbnail = backend.video_thumbnail(&f.path, (128, 128)).unwrap();
+
+    assert_eq!((thumbnail.frame.width, thumbnail.frame.height), (128, 96));
+    let duration = thumbnail.duration.expect("an mp4 should report a duration");
+    assert!(
+        duration >= Duration::from_millis(800) && duration <= Duration::from_millis(1200),
+        "expected about a second, got {duration:?}"
+    );
+}
+
+#[test]
+fn probing_reads_the_duration_without_decoding() {
+    let Some(f) = fixture() else { return };
+    let backend = MediaFoundation::new().unwrap();
+    let duration = backend.probe_duration(&f.path).unwrap().expect("no duration");
+    assert!(
+        duration >= Duration::from_millis(800) && duration <= Duration::from_millis(1200),
+        "expected about a second, got {duration:?}"
+    );
+}
+
+#[test]
+fn probing_a_file_that_is_not_a_video_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nope.mp4");
+    std::fs::write(&path, b"not a video at all").unwrap();
+
+    let backend = MediaFoundation::new().unwrap();
+    assert!(backend.probe_duration(&path).is_err());
 }

@@ -45,13 +45,30 @@ pub trait VideoStream: Send {
     fn size(&self) -> (u32, u32);
 }
 
+/// A poster frame together with what else was learned while opening the file.
+pub struct VideoThumbnail {
+    pub frame: Frame,
+    /// Running time, when the container reports one.
+    pub duration: Option<Duration>,
+}
+
 pub trait MediaBackend: Send + Sync + 'static {
     /// Opens a video, decoding no larger than `max` since a tile cannot show
     /// more pixels than that anyway.
     fn open_video(&self, path: &Path, max: (u32, u32)) -> Result<Box<dyn VideoStream>>;
 
     /// Grabs a single representative frame for a still thumbnail.
-    fn video_thumbnail(&self, path: &Path, max: (u32, u32)) -> Result<Frame>;
+    ///
+    /// The running time comes back with it because opening the file is the
+    /// expensive part, and having it means sorting by length later costs
+    /// nothing for anything already thumbnailed.
+    fn video_thumbnail(&self, path: &Path, max: (u32, u32)) -> Result<VideoThumbnail>;
+
+    /// Reads just the running time, without decoding a frame.
+    ///
+    /// Used when sorting by length needs to know about files that are not on
+    /// screen and so have never been thumbnailed.
+    fn probe_duration(&self, path: &Path) -> Result<Option<Duration>>;
 }
 
 /// Where in a video to grab the poster frame.

@@ -3,13 +3,14 @@
 
 use crate::player::PlaybackService;
 use crate::slots::plan_slots;
-use crate::thumbs::{ThumbnailRequest, ThumbnailService, thumbnail_tier};
+use crate::thumbs::{Job, ThumbnailService, thumbnail_tier};
 use eframe::egui::{
     self, Align2, Color32, Context, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, TextureHandle,
     TextureOptions, Ui, Vec2,
 };
 use mandala_core::layout::{GridLayout, TileSize};
 use mandala_core::schedule::{PlaybackCandidate, ScheduleParams, plan_playback};
+use mandala_core::sort::{Sort, SortKey, SortOrder, sort_entries};
 use mandala_core::{CacheKey, Entry, MediaKind, scan_dir};
 use mandala_media::Frame;
 use mandala_media::mf::MediaFoundation;
@@ -75,6 +76,7 @@ pub struct Settings {
     pub autoplay: bool,
     pub budget: usize,
     pub show_labels: bool,
+    pub sort: Sort,
 }
 
 impl Settings {
@@ -96,7 +98,13 @@ pub const MAX_BUDGET: usize = 32;
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { tile_px: 260.0, autoplay: true, budget: 12, show_labels: true }
+        Self {
+            tile_px: 260.0,
+            autoplay: true,
+            budget: 12,
+            show_labels: true,
+            sort: Sort::default(),
+        }
     }
 }
 
@@ -113,15 +121,26 @@ pub struct MandalaApp {
     thumbs: ThumbnailService,
     player: PlaybackService,
 
-    /// Still thumbnail per tile.
-    thumb_textures: HashMap<usize, TextureHandle>,
+    /// Still thumbnail per file. Keyed by path rather than by position, so
+    /// re-sorting the folder does not throw away everything already loaded.
+    thumb_textures: HashMap<PathBuf, TextureHandle>,
     /// Live video frame per tile, drawn in place of the still when present.
+    /// Positional, because a playback slot is bound to a position.
     video_textures: HashMap<usize, TextureHandle>,
-    /// Cache key per tile, and the reverse map for routing results back.
-    tile_keys: Vec<Option<CacheKey>>,
-    key_to_tile: HashMap<CacheKey, usize>,
-    requested: HashSet<CacheKey>,
-    failed: HashSet<CacheKey>,
+    /// Position of each file, for routing worker results back to a tile.
+    path_to_tile: HashMap<PathBuf, usize>,
+    /// Running times learned so far. A stored `None` means the file was asked
+    /// about and has no duration, which is not the same as never having asked.
+    durations: HashMap<PathBuf, Option<Duration>>,
+    requested_thumbs: HashSet<PathBuf>,
+    requested_durations: HashSet<PathBuf>,
+    failed_thumbs: HashSet<PathBuf>,
+    /// Tier the on-screen thumbnails were asked for at.
+    current_tier: u32,
+    /// Sort the entries are currently in, to notice when the setting changes.
+    applied_sort: Sort,
+    /// Set when a newly learned duration invalidates the current order.
+    needs_resort: bool,
 
     /// Where each playing tile has got to, for drawing its seek bar.
     playback: HashMap<usize, PlaybackInfo>,
@@ -156,6 +175,7 @@ impl MandalaApp {
             .sanitized();
         player.resize(settings.budget);
 
+        let applied_sort = settings.sort;
         let mut app = Self {
             current_dir: PathBuf::new(),
             entries: Vec::new(),
@@ -167,10 +187,14 @@ impl MandalaApp {
             player,
             thumb_textures: HashMap::new(),
             video_textures: HashMap::new(),
-            tile_keys: Vec::new(),
-            key_to_tile: HashMap::new(),
-            requested: HashSet::new(),
-            failed: HashSet::new(),
+            path_to_tile: HashMap::new(),
+            durations: HashMap::new(),
+            requested_thumbs: HashSet::new(),
+            requested_durations: HashSet::new(),
+            failed_thumbs: HashSet::new(),
+            current_tier: 0,
+            applied_sort,
+            needs_resort: false,
             playback: HashMap::new(),
             hovered: None,
             visible: 0..0,
@@ -186,75 +210,80 @@ impl MandalaApp {
         self.thumb_textures.clear();
         self.video_textures.clear();
         self.playback.clear();
-        self.requested.clear();
-        self.failed.clear();
-        self.key_to_tile.clear();
+        self.requested_thumbs.clear();
+        self.requested_durations.clear();
+        self.failed_thumbs.clear();
+        self.durations.clear();
         self.hovered = None;
         self.visible = 0..0;
 
         match scan_dir(&path) {
             Ok(entries) => {
-                self.tile_keys = entries
-                    .iter()
-                    .map(|entry| {
-                        entry.kind.has_thumbnail().then(|| {
-                            CacheKey::new(
-                                &entry.path,
-                                entry.mtime_unix_nanos(),
-                                entry.len,
-                                thumbnail_tier(self.settings.tile_px as u32),
-                            )
-                        })
-                    })
-                    .collect();
-                for (index, key) in self.tile_keys.iter().enumerate() {
-                    if let Some(key) = key {
-                        self.key_to_tile.insert(key.clone(), index);
-                    }
-                }
                 self.entries = entries;
                 self.error = None;
                 self.path_edit = path.display().to_string();
                 self.current_dir = path;
+                self.resort();
             }
             Err(e) => {
                 self.error = Some(format!("{}: {e}", path.display()));
+                self.entries.clear();
+                self.path_to_tile.clear();
             }
         }
     }
 
-    /// Recomputes cache keys after the tile size crosses into another tier.
+    /// Puts the entries in the configured order and rebuilds the position map.
+    ///
+    /// Playback is tied to positions, so anything playing has to stop when
+    /// positions move -- but only then. Sorting by length re-sorts every time
+    /// another duration arrives, and most of those change nothing; tearing
+    /// down playback for each would mean nothing ever gets to play while a
+    /// folder is being probed.
+    fn resort(&mut self) {
+        let durations = &self.durations;
+        sort_entries(&mut self.entries, self.settings.sort, |entry| {
+            durations.get(&entry.path).copied().flatten()
+        });
+
+        if order_changed(&self.entries, &self.path_to_tile) {
+            self.path_to_tile = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.path.clone(), index))
+                .collect();
+
+            self.player.stop_all();
+            self.video_textures.clear();
+            self.playback.clear();
+        }
+        self.applied_sort = self.settings.sort;
+        self.needs_resort = false;
+    }
+
+    /// Cache key for an entry at the current thumbnail tier.
+    fn thumbnail_key(&self, entry: &Entry) -> CacheKey {
+        CacheKey::new(&entry.path, entry.mtime_unix_nanos(), entry.len, self.current_tier)
+    }
+
+    fn metadata_key(entry: &Entry) -> CacheKey {
+        CacheKey::metadata(&entry.path, entry.mtime_unix_nanos(), entry.len)
+    }
+
+    /// Notices the tile size crossing into another thumbnail tier.
+    ///
+    /// The textures on screen stay up until their sharper replacements arrive;
+    /// a grid that blanks while the size slider is dragged would be far worse
+    /// than one that is briefly soft.
     fn retier_thumbnails(&mut self) {
         let tier = thumbnail_tier(self.settings.tile_px as u32);
-        let stale = self
-            .tile_keys
-            .iter()
-            .zip(&self.entries)
-            .any(|(key, entry)| match key {
-                Some(key) => {
-                    *key != CacheKey::new(&entry.path, entry.mtime_unix_nanos(), entry.len, tier)
-                }
-                None => false,
-            });
-        if !stale {
+        if tier == self.current_tier {
             return;
         }
-
-        self.key_to_tile.clear();
-        self.requested.clear();
-        self.failed.clear();
-        for (index, entry) in self.entries.iter().enumerate() {
-            let key = entry.kind.has_thumbnail().then(|| {
-                CacheKey::new(&entry.path, entry.mtime_unix_nanos(), entry.len, tier)
-            });
-            if let Some(key) = &key {
-                self.key_to_tile.insert(key.clone(), index);
-            }
-            self.tile_keys[index] = key;
-        }
-        // The textures on screen stay until their replacements arrive; a blank
-        // grid while dragging the size slider would be far worse than a
-        // slightly soft one.
+        self.current_tier = tier;
+        self.requested_thumbs.clear();
+        self.failed_thumbs.clear();
     }
 
     fn parent_dir(&self) -> Option<PathBuf> {
@@ -272,17 +301,29 @@ impl MandalaApp {
     }
 
     fn collect_results(&mut self, ctx: &Context) {
-        for result in self.thumbs.drain().collect::<Vec<_>>() {
-            let Some(&tile) = self.key_to_tile.get(&result.key) else { continue };
-            match result.outcome {
-                Ok(frame) => {
-                    let texture = upload(ctx, &format!("thumb{tile}"), &frame);
-                    self.thumb_textures.insert(tile, texture);
+        for done in self.thumbs.drain().collect::<Vec<_>>() {
+            if let Some(duration) = done.duration {
+                // A newly learned length can change where its tile belongs.
+                let known = self.durations.insert(done.path.clone(), Some(duration));
+                if known != Some(Some(duration)) && self.settings.sort.key == SortKey::Duration {
+                    self.needs_resort = true;
+                }
+            } else if self.requested_durations.contains(&done.path) {
+                // Asked and there is none; remembered so it is not asked again.
+                self.durations.entry(done.path.clone()).or_insert(None);
+            }
+
+            match done.thumbnail {
+                Some(Ok(frame)) => {
+                    let name = done.path.to_string_lossy().into_owned();
+                    let texture = upload(ctx, &name, &frame);
+                    self.thumb_textures.insert(done.path, texture);
                 }
                 // Remembering the failure stops it being retried every frame.
-                Err(_) => {
-                    self.failed.insert(result.key);
+                Some(Err(_)) => {
+                    self.failed_thumbs.insert(done.path);
                 }
+                None => {}
             }
         }
 
@@ -307,21 +348,58 @@ impl MandalaApp {
     /// Asks for the thumbnails of everything on screen that lacks one.
     fn request_visible_thumbnails(&mut self) {
         for index in self.visible.clone() {
-            if self.thumb_textures.contains_key(&index) {
-                continue;
-            }
-            let Some(Some(key)) = self.tile_keys.get(index) else { continue };
-            if self.requested.contains(key) || self.failed.contains(key) {
-                continue;
-            }
             let Some(entry) = self.entries.get(index) else { continue };
-            self.requested.insert(key.clone());
-            self.thumbs.request(ThumbnailRequest {
-                key: key.clone(),
+            if !entry.kind.has_thumbnail()
+                || self.thumb_textures.contains_key(&entry.path)
+                || self.requested_thumbs.contains(&entry.path)
+                || self.failed_thumbs.contains(&entry.path)
+            {
+                continue;
+            }
+            self.requested_thumbs.insert(entry.path.clone());
+            self.thumbs.request(Job::Thumbnail {
                 path: entry.path.clone(),
                 kind: entry.kind,
-                tier: thumbnail_tier(self.settings.tile_px as u32),
+                key: self.thumbnail_key(entry),
+                meta_key: Self::metadata_key(entry),
+                tier: self.current_tier,
             });
+        }
+    }
+
+    /// Asks for the running times that sorting by length is waiting on.
+    ///
+    /// Only while that sort is selected: probing every video in a large folder
+    /// is real work, and nothing else needs the answer. A few per frame keeps
+    /// the queue from being flooded by one enormous folder.
+    fn request_missing_durations(&mut self) {
+        if self.settings.sort.key != SortKey::Duration {
+            return;
+        }
+        const PER_FRAME: usize = 24;
+
+        let mut jobs = Vec::new();
+        for entry in &self.entries {
+            if jobs.len() >= PER_FRAME {
+                break;
+            }
+            if entry.kind != MediaKind::Video
+                || self.durations.contains_key(&entry.path)
+                || self.requested_durations.contains(&entry.path)
+            {
+                continue;
+            }
+            jobs.push((
+                entry.path.clone(),
+                Job::Duration {
+                    path: entry.path.clone(),
+                    meta_key: Self::metadata_key(entry),
+                },
+            ));
+        }
+        for (path, job) in jobs {
+            self.requested_durations.insert(path);
+            self.thumbs.request(job);
         }
     }
 
@@ -388,7 +466,10 @@ impl MandalaApp {
         let margin = TEXTURE_KEEP_ROWS * layout.columns();
         let keep_start = self.visible.start.saturating_sub(margin);
         let keep_end = self.visible.end.saturating_add(margin);
-        self.thumb_textures.retain(|&i, _| i >= keep_start && i < keep_end);
+        let positions = &self.path_to_tile;
+        self.thumb_textures.retain(|path, _| {
+            positions.get(path).is_some_and(|&i| i >= keep_start && i < keep_end)
+        });
         // Video textures belong to playing tiles, which are visible by
         // definition; anything else is a leftover from a stopped slot.
         let playing: HashSet<usize> = self.player.holding().into_iter().flatten().collect();
@@ -427,6 +508,25 @@ impl MandalaApp {
                 ui.label("at once");
                 ui.add(egui::Slider::new(&mut self.settings.budget, 1..=MAX_BUDGET));
                 ui.separator();
+
+                ui.label("Sort");
+                egui::ComboBox::from_id_salt("sort-key")
+                    .selected_text(self.settings.sort.key.label())
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for key in SortKey::ALL {
+                            ui.selectable_value(&mut self.settings.sort.key, key, key.label());
+                        }
+                    });
+                let (arrow, tip) = match self.settings.sort.order {
+                    SortOrder::Ascending => ("\u{2191}", "Ascending"),
+                    SortOrder::Descending => ("\u{2193}", "Descending"),
+                };
+                if ui.button(arrow).on_hover_text(tip).clicked() {
+                    self.settings.sort.order = self.settings.sort.order.flipped();
+                }
+
+                ui.separator();
                 ui.checkbox(&mut self.settings.show_labels, "Names");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -460,7 +560,8 @@ impl MandalaApp {
 
         let image_area = self.image_area(rect);
 
-        let texture = self.video_textures.get(&index).or_else(|| self.thumb_textures.get(&index));
+        let texture =
+            self.video_textures.get(&index).or_else(|| self.thumb_textures.get(&entry.path));
         match texture {
             Some(texture) => {
                 let fitted = fit_rect(image_area, texture.size_vec2());
@@ -598,10 +699,17 @@ impl eframe::App for MandalaApp {
                 self.hovered = hovered_now;
                 self.retier_thumbnails();
                 self.request_visible_thumbnails();
+                self.request_missing_durations();
                 self.schedule_playback(&layout, center, settled);
                 self.trim_textures(&layout);
             });
         });
+
+        // Re-sorting moves every tile, so it happens once the frame is drawn
+        // rather than underneath the loop that is drawing it.
+        if self.settings.sort != self.applied_sort || self.needs_resort {
+            self.resort();
+        }
 
         if let Some((index, position)) = seek_request {
             self.player.seek(index, position);
@@ -610,6 +718,14 @@ impl eframe::App for MandalaApp {
             self.activate(index);
         }
     }
+}
+
+/// Whether any entry sits somewhere other than where `positions` had it.
+fn order_changed(entries: &[Entry], positions: &HashMap<PathBuf, usize>) -> bool {
+    entries.len() != positions.len()
+        || entries.iter().enumerate().any(|(index, entry)| {
+            positions.get(&entry.path) != Some(&index)
+        })
 }
 
 /// The strip along the bottom of a tile that scrubs playback.
@@ -752,6 +868,46 @@ mod tests {
         assert_eq!(fit_rect(bounds, Vec2::ZERO).width(), 0.0);
     }
 
+    fn positions(paths: &[&str]) -> HashMap<PathBuf, usize> {
+        paths.iter().enumerate().map(|(i, p)| (PathBuf::from(p), i)).collect()
+    }
+
+    fn entries(paths: &[&str]) -> Vec<Entry> {
+        paths
+            .iter()
+            .map(|p| Entry {
+                path: PathBuf::from(p),
+                name: (*p).to_owned(),
+                kind: MediaKind::Video,
+                len: 0,
+                modified: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_unchanged_order_is_recognised_as_unchanged() {
+        let paths = ["a.mp4", "b.mp4", "c.mp4"];
+        assert!(!order_changed(&entries(&paths), &positions(&paths)));
+    }
+
+    #[test]
+    fn a_swapped_pair_counts_as_changed() {
+        assert!(order_changed(&entries(&["b.mp4", "a.mp4"]), &positions(&["a.mp4", "b.mp4"])));
+    }
+
+    #[test]
+    fn a_different_number_of_entries_counts_as_changed() {
+        assert!(order_changed(&entries(&["a.mp4"]), &positions(&["a.mp4", "b.mp4"])));
+        assert!(order_changed(&entries(&["a.mp4", "b.mp4"]), &positions(&["a.mp4"])));
+    }
+
+    #[test]
+    fn the_first_sort_of_a_folder_counts_as_changed() {
+        // Positions start empty, so the initial sort must be treated as a move.
+        assert!(order_changed(&entries(&["a.mp4"]), &HashMap::new()));
+    }
+
     fn image_area() -> Rect {
         Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(200.0, 100.0))
     }
@@ -830,13 +986,21 @@ mod tests {
 
     #[test]
     fn settings_survive_a_round_trip_through_serde() {
-        let settings = Settings { tile_px: 480.0, autoplay: false, budget: 7, show_labels: false };
+        let settings = Settings {
+            tile_px: 480.0,
+            autoplay: false,
+            budget: 7,
+            show_labels: false,
+            sort: Sort { key: SortKey::Size, order: SortOrder::Descending },
+        };
         let encoded = ron::to_string(&settings).unwrap();
         let decoded: Settings = ron::from_str(&encoded).unwrap();
         assert_eq!(decoded.tile_px, 480.0);
         assert_eq!(decoded.budget, 7);
         assert!(!decoded.autoplay);
         assert!(!decoded.show_labels);
+        assert_eq!(decoded.sort.key, SortKey::Size);
+        assert_eq!(decoded.sort.order, SortOrder::Descending);
     }
 
     #[test]

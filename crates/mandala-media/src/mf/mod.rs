@@ -8,7 +8,9 @@
 
 pub mod d3d;
 
-use crate::backend::{Advance, MediaBackend, VideoStream, thumbnail_timestamp};
+use crate::backend::{
+    Advance, MediaBackend, VideoStream, VideoThumbnail, thumbnail_timestamp,
+};
 use crate::frame::{Frame, Layout};
 use crate::sizing::fit_within;
 use anyhow::{Context, Result, anyhow};
@@ -111,23 +113,30 @@ impl MediaBackend for MediaFoundation {
         Ok(Box::new(MfStream::open(path, max)?))
     }
 
-    fn video_thumbnail(&self, path: &Path, max: (u32, u32)) -> Result<Frame> {
+    fn video_thumbnail(&self, path: &Path, max: (u32, u32)) -> Result<VideoThumbnail> {
         let mut stream = MfStream::open(path, max)?;
-        let target = thumbnail_timestamp(stream.duration());
+        let duration = stream.duration();
+        let target = thumbnail_timestamp(duration);
         if target > Duration::ZERO {
             stream.seek_to(target)?;
         }
         if let Advance::Frame(frame) = stream.advance_to(target)? {
-            return Ok(frame);
+            return Ok(VideoThumbnail { frame, duration });
         }
 
         // Seeking can land past the last keyframe of a very short or truncated
         // file, which still has an opening frame worth showing.
         stream.seek_to(Duration::ZERO)?;
         match stream.advance_to(Duration::ZERO)? {
-            Advance::Frame(frame) => Ok(frame),
+            Advance::Frame(frame) => Ok(VideoThumbnail { frame, duration }),
             _ => Err(anyhow!("no decodable frame in {}", path.display())),
         }
+    }
+
+    fn probe_duration(&self, path: &Path) -> Result<Option<Duration>> {
+        // Opened at a token size: the reader still parses the container, which
+        // is where the duration lives, but sets nothing up to decode with.
+        Ok(MfStream::open(path, (16, 16))?.duration())
     }
 }
 

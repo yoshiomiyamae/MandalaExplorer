@@ -376,8 +376,16 @@ mod tests {
             }))
         }
 
-        fn video_thumbnail(&self, _path: &Path, _max: (u32, u32)) -> Result<Frame> {
+        fn video_thumbnail(
+            &self,
+            _path: &Path,
+            _max: (u32, u32),
+        ) -> Result<mandala_media::VideoThumbnail> {
             anyhow::bail!("not used in these tests")
+        }
+
+        fn probe_duration(&self, _path: &Path) -> Result<Option<Duration>> {
+            Ok(Some(Duration::from_secs(1)))
         }
     }
 

@@ -63,12 +63,14 @@ fn write_image(path: &Path, seed: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Writes a two second clip whose colour sweeps, so motion is obvious even in
-/// a small tile.
+/// Writes a short clip whose colour sweeps, so motion is obvious even in a
+/// small tile. Lengths vary between clips so that sorting by duration has
+/// something to actually sort.
 fn write_video(path: &Path, seed: u32) -> anyhow::Result<()> {
     const W: u32 = 640;
     const H: u32 = 360;
-    let frames = FPS * 2;
+    let seconds = 1 + (seed % 5);
+    let frames = FPS * seconds;
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
