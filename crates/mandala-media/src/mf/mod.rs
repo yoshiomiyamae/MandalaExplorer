@@ -33,6 +33,12 @@ const MF_VIDEO_FORMAT_ABGR32: GUID = GUID::from_u128(0x00000020_0000_0010_8000_0
 /// the final sample.
 const SEEK_END_MARGIN: Duration = Duration::from_millis(200);
 
+/// Stream selectors. The bindings expose these as enums over signed integers
+/// while every call site wants a `u32`, so the cast is named once here.
+const VIDEO_STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+const ALL_STREAMS: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
+const MEDIA_SOURCE: u32 = MF_SOURCE_READER_MEDIASOURCE.0 as u32;
+
 /// Media Foundation timestamps are in 100-nanosecond units.
 fn to_hns(d: Duration) -> i64 {
     (d.as_nanos() / 100).min(i64::MAX as u128) as i64
@@ -132,9 +138,25 @@ impl MediaBackend for MediaFoundation {
     }
 
     fn probe_duration(&self, path: &Path) -> Result<Option<Duration>> {
-        // Opened at a token size: the reader still parses the container, which
-        // is where the duration lives, but sets nothing up to decode with.
-        Ok(MfStream::open(path, (16, 16))?.duration())
+        ensure_startup()?;
+        ensure_thread_com();
+        unsafe {
+            // No D3D manager, no advanced video processing, no output format
+            // negotiation. All of that instantiates a decoder and a video
+            // processor, and none of it is needed to read one integer out of a
+            // container header. Sorting a large folder by length opens every
+            // video in it, so this is the difference between that being quick
+            // and being the slowest thing the app does.
+            let url = HSTRING::from(path.as_os_str());
+            let reader = MFCreateSourceReaderFromURL(&url, None)
+                .with_context(|| format!("opening {}", path.display()))?;
+            // Asking for the video type is what separates a file with no video
+            // in it from a video whose length the container does not state.
+            reader
+                .GetNativeMediaType(VIDEO_STREAM, 0)
+                .with_context(|| format!("no video stream in {}", path.display()))?;
+            Ok(read_duration(&reader))
+        }
     }
 }
 
@@ -178,22 +200,20 @@ impl MfStream {
             let reader = MFCreateSourceReaderFromURL(&url, &attributes)
                 .with_context(|| format!("opening {}", path.display()))?;
 
-            let all = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
-            let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-            reader.SetStreamSelection(all, false)?;
-            reader.SetStreamSelection(video, true)?;
+            reader.SetStreamSelection(ALL_STREAMS, false)?;
+            reader.SetStreamSelection(VIDEO_STREAM, true)?;
 
             let native = reader
-                .GetNativeMediaType(video, 0)
+                .GetNativeMediaType(VIDEO_STREAM, 0)
                 .with_context(|| format!("no video stream in {}", path.display()))?;
             let native_size = unpack_size(native.GetUINT64(&MF_MT_FRAME_SIZE)?);
             let size = fit_within(native_size, max);
 
-            let swap_rb = negotiate_output(&reader, video, size)?;
+            let swap_rb = negotiate_output(&reader, VIDEO_STREAM, size)?;
 
             // The processor may not honour the requested size exactly, so the
             // negotiated type is what the frame converter has to trust.
-            let actual = reader.GetCurrentMediaType(video)?;
+            let actual = reader.GetCurrentMediaType(VIDEO_STREAM)?;
             let size = unpack_size(actual.GetUINT64(&MF_MT_FRAME_SIZE)?);
             let duration = read_duration(&reader);
 
@@ -226,14 +246,13 @@ impl MfStream {
     /// Pulls one sample. `None` means end of stream; a sample of `None` is a
     /// gap or a format change, which the caller reads past.
     unsafe fn read_sample(&mut self) -> Result<Option<(Option<IMFSample>, Duration)>> {
-        let video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
         let mut flags = 0u32;
         let mut timestamp = 0i64;
         let mut sample: Option<IMFSample> = None;
 
         unsafe {
             self.reader.ReadSample(
-                video,
+                VIDEO_STREAM,
                 0,
                 None,
                 Some(&mut flags),
@@ -305,7 +324,7 @@ impl Drop for MfStream {
         unsafe {
             let mut service: *mut core::ffi::c_void = std::ptr::null_mut();
             let found = self.reader.GetServiceForStream(
-                MF_SOURCE_READER_MEDIASOURCE.0 as u32,
+                MEDIA_SOURCE,
                 &GUID::zeroed(),
                 &IMFMediaSource::IID,
                 &mut service,
@@ -360,10 +379,6 @@ impl VideoStream for MfStream {
     fn seek(&mut self, position: Duration) -> Result<()> {
         self.seek_to(position)
     }
-
-    fn size(&self) -> (u32, u32) {
-        self.size
-    }
 }
 
 /// Settles on an output format, preferring one that needs no channel swap.
@@ -410,13 +425,13 @@ fn unpack_size(packed: u64) -> (u32, u32) {
 /// container provides.
 fn read_duration(reader: &IMFSourceReader) -> Option<Duration> {
     unsafe {
-        let mut value = reader
-            .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
-            .ok()?;
+        let mut value = reader.GetPresentationAttribute(MEDIA_SOURCE, &MF_PD_DURATION).ok()?;
         let hns = propvariant_u64(&value);
         let _ = PropVariantClear(&mut value);
-        let hns = hns?;
-        (hns > 0).then(|| Duration::from_nanos(hns.saturating_mul(100)))
+        // Through the same conversion as every other timestamp here, rather
+        // than a second spelling of it.
+        let hns = i64::try_from(hns?).ok()?;
+        (hns > 0).then(|| from_hns(hns))
     }
 }
 

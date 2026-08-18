@@ -34,9 +34,14 @@ impl Entry {
     }
 }
 
-/// Lists `dir` non-recursively, directories first, then entries in natural
-/// order. Unreadable children are skipped rather than failing the whole scan,
-/// since one permission-denied file should not blank the entire view.
+/// Lists `dir` non-recursively, in whatever order the filesystem gives.
+///
+/// Ordering is [`crate::sort::sort_entries`]'s job: callers pick a sort anyway,
+/// and sorting here as well meant every folder was ordered twice on the way to
+/// being displayed once.
+///
+/// Unreadable children are skipped rather than failing the whole scan, since
+/// one permission-denied file should not blank the entire view.
 pub fn scan_dir(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -53,7 +58,6 @@ pub fn scan_dir(dir: &Path) -> io::Result<Vec<Entry>> {
         });
     }
 
-    entries.sort_by(|a, b| b.is_dir().cmp(&a.is_dir()).then_with(|| natural_cmp(&a.name, &b.name)));
     Ok(entries)
 }
 
@@ -134,27 +138,17 @@ mod tests {
     }
 
     #[test]
-    fn scan_lists_directories_before_files() {
+    fn scan_reports_what_each_entry_is() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("a.mp4"), b"v").unwrap();
         fs::create_dir(tmp.path().join("zdir")).unwrap();
 
         let got = scan_dir(tmp.path()).unwrap();
-        let names: Vec<_> = got.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["zdir", "a.mp4"]);
-        assert!(got[0].is_dir());
-        assert_eq!(got[1].kind, MediaKind::Video);
-    }
-
-    #[test]
-    fn scan_sorts_files_naturally() {
-        let tmp = tempfile::tempdir().unwrap();
-        for n in ["img10.png", "img2.png", "img1.png"] {
-            fs::write(tmp.path().join(n), b"i").unwrap();
-        }
-        let got = scan_dir(tmp.path()).unwrap();
-        let names: Vec<_> = got.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["img1.png", "img2.png", "img10.png"]);
+        assert_eq!(got.len(), 2);
+        let dir = got.iter().find(|e| e.name == "zdir").expect("directory missing");
+        let file = got.iter().find(|e| e.name == "a.mp4").expect("file missing");
+        assert!(dir.is_dir());
+        assert_eq!(file.kind, MediaKind::Video);
     }
 
     #[test]

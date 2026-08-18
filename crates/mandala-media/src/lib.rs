@@ -15,6 +15,16 @@ pub mod mf;
 #[cfg(windows)]
 pub use mf::MediaFoundation;
 
+/// The decoding backend for this platform.
+///
+/// The point of the [`MediaBackend`] seam is that callers never name an
+/// implementation, so the choice of one belongs here rather than in whoever
+/// happens to construct it.
+#[cfg(windows)]
+pub fn default_backend() -> anyhow::Result<impl MediaBackend + Copy> {
+    MediaFoundation::new()
+}
+
 pub use backend::{Advance, MediaBackend, VideoStream, VideoThumbnail};
 pub use frame::Frame;
 pub use sizing::fit_within;

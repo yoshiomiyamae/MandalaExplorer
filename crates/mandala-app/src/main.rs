@@ -8,7 +8,6 @@ mod app;
 mod cache;
 mod fonts;
 mod player;
-mod slots;
 mod thumbs;
 
 use std::path::PathBuf;

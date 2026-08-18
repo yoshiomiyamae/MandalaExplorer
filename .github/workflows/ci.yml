@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Backtraces cost nothing here and turn a bare test failure into something
+  # actionable without a second run.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    # Windows only, and not by preference: decoding goes through Media
+    # Foundation, so there is nothing to build anywhere else.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The Media Foundation tests synthesise an H.264 clip and decode it back.
+      # A runner without an encoder, or without a GPU to make a D3D11 device on,
+      # skips those rather than failing: the point of the suite is to catch our
+      # own regressions, not to assert what Microsoft installed on the image.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p mandala-app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mandala
+          path: target/release/mandala.exe
+          if-no-files-found: error

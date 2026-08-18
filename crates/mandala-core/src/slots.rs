@@ -1,5 +1,11 @@
 //! Matching playback slots to the tiles that should be playing.
 //!
+//! The other half of [`crate::schedule`]: that decides which tiles deserve to
+//! play, this decides which decoder ends up on each of them. They share a
+//! contract -- the wanted list is most-important-first, so its tail is what
+//! gets dropped when slots run short -- and keeping them in one crate is what
+//! keeps that contract honest.
+//!
 //! Slots are the scarce resource: each one owns a decoder and a worker thread.
 //! Reassigning a slot means tearing down a decoder and opening another, so the
 //! whole point here is to leave a slot alone when it already holds a video that

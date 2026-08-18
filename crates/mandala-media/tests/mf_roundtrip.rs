@@ -160,9 +160,13 @@ fn decodes_a_video_the_right_way_up_and_with_the_right_colours() {
 fn decodes_scaled_down_when_the_tile_is_small() {
     let Some(f) = fixture() else { return };
     let backend = MediaFoundation::new().unwrap();
-    let stream = backend.open_video(&f.path, (64, 64)).unwrap();
+    let mut stream = backend.open_video(&f.path, (64, 64)).unwrap();
+
+    let Advance::Frame(frame) = stream.advance_to(Duration::ZERO).unwrap() else {
+        panic!("no frame");
+    };
     // 320x240 into a 64x64 box keeps the 4:3 ratio.
-    assert_eq!(stream.size(), (64, 48));
+    assert_eq!((frame.width, frame.height), (64, 48));
 }
 
 #[test]

@@ -5,8 +5,8 @@
 //! to being reassigned while still pacing itself -- no polling loop and no
 //! separate timer.
 
-use crate::slots::SlotPlan;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
+use mandala_core::slots::SlotPlan;
 use mandala_media::backend::Advance;
 use mandala_media::{Frame, MediaBackend, VideoStream};
 use std::path::PathBuf;
@@ -31,6 +31,14 @@ pub struct DecodedFrame {
     pub duration: Option<Duration>,
 }
 
+/// Frame rate a slot should run at, given what it holds and what is hovered.
+///
+/// Stated once: two copies of this drifting apart leaves a slot stuck at the
+/// wrong rate until the next hover change, which is hard to trace back.
+fn rate_for(tile: Option<usize>, hovered: Option<usize>) -> f32 {
+    if tile.is_some() && tile == hovered { HOVER_FPS } else { AMBIENT_FPS }
+}
+
 enum Command {
     Play { tile: usize, path: PathBuf, max: (u32, u32), generation: u64, fps: f32 },
     SetFps(f32),
@@ -43,7 +51,6 @@ type SpawnSlot = Box<dyn Fn(usize, Receiver<Command>, Sender<DecodedFrame>)>;
 
 struct SlotHandle {
     commands: Sender<Command>,
-    worker: Option<std::thread::JoinHandle<()>>,
     /// Tile this slot is playing, as far as the UI thread knows.
     holding: Option<usize>,
     fps: f32,
@@ -51,6 +58,8 @@ struct SlotHandle {
 
 pub struct PlaybackService {
     slots: Vec<SlotHandle>,
+    /// Mirrors `slots[i].holding`, so it can be handed out as a slice.
+    holding: Vec<Option<usize>>,
     frames: Receiver<DecodedFrame>,
     /// Kept so resizing the pool can spawn more slots wired to the same sink.
     frame_sink: Sender<DecodedFrame>,
@@ -71,12 +80,20 @@ impl PlaybackService {
                 .spawn(move || run_slot(commands, sink, backend, on_frame))
                 .expect("spawning a playback worker");
         });
-        Self { slots: Vec::new(), frames, frame_sink, spawn }
+        Self { slots: Vec::new(), holding: Vec::new(), frames, frame_sink, spawn }
     }
 
     /// What each slot is playing, in slot order -- the input to slot planning.
-    pub fn holding(&self) -> Vec<Option<usize>> {
-        self.slots.iter().map(|s| s.holding).collect()
+    ///
+    /// Borrowed rather than collected: the draw path asks several times a
+    /// frame, and once per stopped slot, which used to be an allocation each.
+    pub fn holding(&self) -> &[Option<usize>] {
+        &self.holding
+    }
+
+    /// The tiles that currently have a decoder, in no particular order.
+    pub fn playing_tiles(&self) -> impl Iterator<Item = usize> + '_ {
+        self.holding.iter().flatten().copied()
     }
 
     pub fn slot_count(&self) -> usize {
@@ -92,8 +109,9 @@ impl PlaybackService {
         while self.slots.len() < count {
             let (commands, receiver) = unbounded();
             (self.spawn)(self.slots.len(), receiver, self.frame_sink.clone());
-            self.slots.push(SlotHandle { commands, worker: None, holding: None, fps: AMBIENT_FPS });
+            self.slots.push(SlotHandle { commands, holding: None, fps: AMBIENT_FPS });
         }
+        self.holding.resize(self.slots.len(), None);
     }
 
     /// Carries out a slot plan. `source` supplies the path and decode size for
@@ -114,22 +132,24 @@ impl PlaybackService {
         for &(slot, tile) in &plan.start {
             let Some((path, max)) = source(tile) else { continue };
             let Some(handle) = self.slots.get_mut(slot) else { continue };
-            let fps = if hovered == Some(tile) { HOVER_FPS } else { AMBIENT_FPS };
+            let fps = rate_for(Some(tile), hovered);
             let _ = handle.commands.send(Command::Play { tile, path, max, generation, fps });
             handle.holding = Some(tile);
             handle.fps = fps;
         }
+        self.sync_holding();
+    }
+
+    fn sync_holding(&mut self) {
+        self.holding.clear();
+        self.holding.extend(self.slots.iter().map(|s| s.holding));
     }
 
     /// Raises the frame rate of the hovered tile and drops everyone else back
     /// to ambient. Cheap enough to call every frame.
     pub fn set_hover(&mut self, hovered: Option<usize>) {
         for handle in &mut self.slots {
-            let wanted = if handle.holding.is_some() && handle.holding == hovered {
-                HOVER_FPS
-            } else {
-                AMBIENT_FPS
-            };
+            let wanted = rate_for(handle.holding, hovered);
             if handle.fps != wanted {
                 let _ = handle.commands.send(Command::SetFps(wanted));
                 handle.fps = wanted;
@@ -154,6 +174,7 @@ impl PlaybackService {
                 handle.holding = None;
             }
         }
+        self.sync_holding();
     }
 
     pub fn drain(&self) -> impl Iterator<Item = DecodedFrame> + '_ {
@@ -161,15 +182,10 @@ impl PlaybackService {
     }
 }
 
-impl Drop for PlaybackService {
-    fn drop(&mut self) {
-        // Dropping every command sender is what tells the workers to finish.
-        let workers: Vec<_> = self.slots.drain(..).filter_map(|mut s| s.worker.take()).collect();
-        for worker in workers {
-            let _ = worker.join();
-        }
-    }
-}
+// No Drop impl: dropping the slots drops every command sender, which is what
+// tells the workers to finish. An earlier version kept JoinHandles to wait on,
+// except the spawn closure discarded them, so it waited on an empty list and
+// read as an orderly shutdown that was not happening.
 
 struct Playing {
     stream: Box<dyn VideoStream>,
@@ -345,10 +361,6 @@ mod tests {
             self.clock = Duration::ZERO;
             Ok(())
         }
-
-        fn size(&self) -> (u32, u32) {
-            (1, 1)
-        }
     }
 
     #[derive(Clone)]
@@ -429,7 +441,7 @@ mod tests {
         let (mut service, _, _) = service();
         service.resize(3);
         assert_eq!(service.slot_count(), 3);
-        assert_eq!(service.holding(), vec![None, None, None]);
+        assert_eq!(service.holding(), [None, None, None]);
 
         service.resize(1);
         assert_eq!(service.slot_count(), 1);
@@ -442,7 +454,8 @@ mod tests {
 
         let plan = SlotPlan { stop: vec![], start: vec![(0, 42)] };
         service.apply(&plan, 1, None, source);
-        assert_eq!(service.holding(), vec![Some(42), None]);
+        assert_eq!(service.holding(), [Some(42), None]);
+        assert_eq!(service.playing_tiles().collect::<Vec<_>>(), vec![42]);
 
         assert!(eventually(|| opened.load(Ordering::SeqCst) > 0), "video was never opened");
         assert!(
@@ -476,7 +489,7 @@ mod tests {
         assert!(eventually(|| service.drain().next().is_some()));
 
         service.apply(&SlotPlan { stop: vec![0], start: vec![] }, 1, None, source);
-        assert_eq!(service.holding(), vec![None]);
+        assert_eq!(service.holding(), [None]);
 
         // Drain whatever was already in flight, then confirm it stays quiet.
         let _ = service.drain().count();
@@ -517,7 +530,7 @@ mod tests {
         service.resize(1);
         service.apply(&SlotPlan { stop: vec![], start: vec![(0, 1)] }, 1, None, |_| None);
 
-        assert_eq!(service.holding(), vec![None]);
+        assert_eq!(service.holding(), [None]);
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(opened.load(Ordering::SeqCst), 0);
     }
@@ -593,6 +606,7 @@ mod tests {
         service.resize(2);
         service.apply(&SlotPlan { stop: vec![], start: vec![(0, 1), (1, 2)] }, 1, None, source);
         service.stop_all();
-        assert_eq!(service.holding(), vec![None, None]);
+        assert_eq!(service.holding(), [None, None]);
+        assert_eq!(service.playing_tiles().count(), 0);
     }
 }

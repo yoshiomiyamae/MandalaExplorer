@@ -40,9 +40,6 @@ pub trait VideoStream: Send {
     fn restart(&mut self) -> Result<()> {
         self.seek(Duration::ZERO)
     }
-
-    /// Size frames are decoded at, which is at most the requested bound.
-    fn size(&self) -> (u32, u32);
 }
 
 /// A poster frame together with what else was learned while opening the file.

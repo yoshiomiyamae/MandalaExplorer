@@ -28,6 +28,16 @@ impl SortKey {
     pub const ALL: [SortKey; 5] =
         [SortKey::Name, SortKey::Kind, SortKey::Size, SortKey::Modified, SortKey::Duration];
 
+    /// Whether ordering by this key needs facts that are not in an [`Entry`]
+    /// and have to be fetched by opening the file.
+    ///
+    /// Lives here rather than at the call site so a later key that also needs
+    /// probing -- resolution, bitrate -- does not have to be remembered at
+    /// every place that decides whether to spend the work.
+    pub fn needs_probe(self) -> bool {
+        matches!(self, SortKey::Duration)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             SortKey::Name => "Name",
@@ -326,6 +336,14 @@ mod tests {
         let mut empty: Vec<Entry> = Vec::new();
         sort_entries(&mut empty, Sort::default(), no_durations);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn only_length_needs_the_file_opening() {
+        assert!(SortKey::Duration.needs_probe());
+        for key in SortKey::ALL.iter().filter(|k| **k != SortKey::Duration) {
+            assert!(!key.needs_probe(), "{key:?} should be answerable from the scan alone");
+        }
     }
 
     #[test]

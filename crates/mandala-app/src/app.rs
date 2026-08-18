@@ -2,7 +2,6 @@
 //! thumbnails and playback pointed at whatever is on screen.
 
 use crate::player::PlaybackService;
-use crate::slots::plan_slots;
 use crate::thumbs::{Job, ThumbnailService, thumbnail_tier};
 use eframe::egui::{
     self, Align2, Color32, Context, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, TextureHandle,
@@ -10,10 +9,10 @@ use eframe::egui::{
 };
 use mandala_core::layout::{GridLayout, TileSize};
 use mandala_core::schedule::{PlaybackCandidate, ScheduleParams, plan_playback};
+use mandala_core::slots::plan_slots;
 use mandala_core::sort::{Sort, SortKey, SortOrder, sort_entries};
-use mandala_core::{CacheKey, Entry, MediaKind, scan_dir};
+use mandala_core::{Entry, MediaKind, scan_dir};
 use mandala_media::Frame;
-use mandala_media::mf::MediaFoundation;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -101,7 +100,7 @@ impl Default for Settings {
         Self {
             tile_px: 260.0,
             autoplay: true,
-            budget: 12,
+            budget: ScheduleParams::default().budget,
             show_labels: true,
             sort: Sort::default(),
         }
@@ -132,9 +131,17 @@ pub struct MandalaApp {
     /// Running times learned so far. A stored `None` means the file was asked
     /// about and has no duration, which is not the same as never having asked.
     durations: HashMap<PathBuf, Option<Duration>>,
-    requested_thumbs: HashSet<PathBuf>,
+    /// Thumbnails asked for, by path and the tier they were asked at. A
+    /// failure stays in here too: nothing is ever retried within a tier, so a
+    /// separate set of failures would only be a subset of this one.
+    requested_thumbs: HashSet<(PathBuf, u32)>,
     requested_durations: HashSet<PathBuf>,
-    failed_thumbs: HashSet<PathBuf>,
+    /// Videos still to probe for length, newest folder first. Refilled on
+    /// navigation and re-sort, so a folder whose lengths are all known costs
+    /// nothing per frame.
+    unprobed: Vec<usize>,
+    /// The item count line in the toolbar, which changes only on navigation.
+    summary: String,
     /// Tier the on-screen thumbnails were asked for at.
     current_tier: u32,
     /// Sort the entries are currently in, to notice when the setting changes.
@@ -147,6 +154,8 @@ pub struct MandalaApp {
 
     hovered: Option<usize>,
     visible: std::ops::Range<usize>,
+    /// The visible range the last texture sweep was made for.
+    trimmed_for: std::ops::Range<usize>,
     settle: ScrollSettle,
 }
 
@@ -161,7 +170,8 @@ impl MandalaApp {
         // Before anything draws, or the first frame is all boxes.
         crate::fonts::install_fallbacks(&cc.egui_ctx);
 
-        let backend = MediaFoundation::new()?;
+        // Which backend that is, is mandala-media's business.
+        let backend = mandala_media::default_backend()?;
 
         // Workers wake the UI thread when they have something to show, rather
         // than the UI polling at a fixed rate and burning frames on nothing.
@@ -194,13 +204,15 @@ impl MandalaApp {
             durations: HashMap::new(),
             requested_thumbs: HashSet::new(),
             requested_durations: HashSet::new(),
-            failed_thumbs: HashSet::new(),
+            unprobed: Vec::new(),
+            summary: String::new(),
             current_tier: 0,
             applied_sort,
             needs_resort: false,
             playback: HashMap::new(),
             hovered: None,
             visible: 0..0,
+            trimmed_for: 0..0,
             settle: ScrollSettle::default(),
         };
         app.navigate_to(start);
@@ -209,13 +221,10 @@ impl MandalaApp {
 
     fn navigate_to(&mut self, path: PathBuf) {
         self.generation += 1;
-        self.player.stop_all();
+        self.stop_playback();
         self.thumb_textures.clear();
-        self.video_textures.clear();
-        self.playback.clear();
         self.requested_thumbs.clear();
         self.requested_durations.clear();
-        self.failed_thumbs.clear();
         self.durations.clear();
         self.hovered = None;
         self.visible = 0..0;
@@ -232,8 +241,20 @@ impl MandalaApp {
                 self.error = Some(format!("{}: {e}", path.display()));
                 self.entries.clear();
                 self.path_to_tile.clear();
+                self.unprobed.clear();
+                self.summary.clear();
             }
         }
+    }
+
+    /// Tears down everything tied to a playback slot.
+    ///
+    /// Slots are bound to positions, so every caller that moves positions has
+    /// to do all of this; one place to add the next such map to.
+    fn stop_playback(&mut self) {
+        self.player.stop_all();
+        self.video_textures.clear();
+        self.playback.clear();
     }
 
     /// Puts the entries in the configured order and rebuilds the position map.
@@ -256,22 +277,36 @@ impl MandalaApp {
                 .enumerate()
                 .map(|(index, entry)| (entry.path.clone(), index))
                 .collect();
-
-            self.player.stop_all();
-            self.video_textures.clear();
-            self.playback.clear();
+            self.stop_playback();
         }
+        self.refresh_probe_queue();
+        self.summary = self.describe_contents();
         self.applied_sort = self.settings.sort;
         self.needs_resort = false;
     }
 
-    /// Cache key for an entry at the current thumbnail tier.
-    fn thumbnail_key(&self, entry: &Entry) -> CacheKey {
-        CacheKey::new(&entry.path, entry.mtime_unix_nanos(), entry.len, self.current_tier)
+    /// Rebuilds the list of videos whose length is still unknown.
+    ///
+    /// Built once per re-sort rather than rediscovered every frame: walking
+    /// every entry and hashing its path, forever, to find nothing left to do is
+    /// most of the cost of a large folder once the probing has finished.
+    fn refresh_probe_queue(&mut self) {
+        self.unprobed.clear();
+        if !self.settings.sort.key.needs_probe() {
+            return;
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.kind == MediaKind::Video && !self.durations.contains_key(&entry.path) {
+                self.unprobed.push(index);
+            }
+        }
+        // Popped from the back, so the front of the folder is probed first.
+        self.unprobed.reverse();
     }
 
-    fn metadata_key(entry: &Entry) -> CacheKey {
-        CacheKey::metadata(&entry.path, entry.mtime_unix_nanos(), entry.len)
+    fn describe_contents(&self) -> String {
+        let videos = self.entries.iter().filter(|e| e.kind == MediaKind::Video).count();
+        format!("{} items, {videos} video", self.entries.len())
     }
 
     /// Notices the tile size crossing into another thumbnail tier.
@@ -285,8 +320,10 @@ impl MandalaApp {
             return;
         }
         self.current_tier = tier;
-        self.requested_thumbs.clear();
-        self.failed_thumbs.clear();
+        // Requests are keyed by tier, so work already in flight keeps its
+        // record and is not queued a second time by the next frame. Dragging
+        // the slider across a boundary used to re-request the whole visible
+        // set, including the jobs that were running as it did so.
     }
 
     fn parent_dir(&self) -> Option<PathBuf> {
@@ -308,7 +345,7 @@ impl MandalaApp {
             if let Some(duration) = done.duration {
                 // A newly learned length can change where its tile belongs.
                 let known = self.durations.insert(done.path.clone(), Some(duration));
-                if known != Some(Some(duration)) && self.settings.sort.key == SortKey::Duration {
+                if known != Some(Some(duration)) && self.settings.sort.key.needs_probe() {
                     self.needs_resort = true;
                 }
             } else if self.requested_durations.contains(&done.path) {
@@ -316,17 +353,12 @@ impl MandalaApp {
                 self.durations.entry(done.path.clone()).or_insert(None);
             }
 
-            match done.thumbnail {
-                Some(Ok(frame)) => {
-                    let name = done.path.to_string_lossy().into_owned();
-                    let texture = upload(ctx, &name, &frame);
-                    self.thumb_textures.insert(done.path, texture);
-                }
-                // Remembering the failure stops it being retried every frame.
-                Some(Err(_)) => {
-                    self.failed_thumbs.insert(done.path);
-                }
-                None => {}
+            // A failure needs no record of its own: the request set already
+            // stops it being asked for again within this tier.
+            if let Some(Ok(frame)) = done.thumbnail {
+                let name = done.path.to_string_lossy().into_owned();
+                let texture = upload(ctx, &name, &frame);
+                self.thumb_textures.insert(done.path, texture);
             }
         }
 
@@ -350,23 +382,16 @@ impl MandalaApp {
 
     /// Asks for the thumbnails of everything on screen that lacks one.
     fn request_visible_thumbnails(&mut self) {
+        let tier = self.current_tier;
         for index in self.visible.clone() {
             let Some(entry) = self.entries.get(index) else { continue };
             if !entry.kind.has_thumbnail()
-                || self.thumb_textures.contains_key(&entry.path)
-                || self.requested_thumbs.contains(&entry.path)
-                || self.failed_thumbs.contains(&entry.path)
+                || self.requested_thumbs.contains(&(entry.path.clone(), tier))
             {
                 continue;
             }
-            self.requested_thumbs.insert(entry.path.clone());
-            self.thumbs.request(Job::Thumbnail {
-                path: entry.path.clone(),
-                kind: entry.kind,
-                key: self.thumbnail_key(entry),
-                meta_key: Self::metadata_key(entry),
-                tier: self.current_tier,
-            });
+            self.requested_thumbs.insert((entry.path.clone(), tier));
+            self.thumbs.request(Job::thumbnail(entry, tier));
         }
     }
 
@@ -376,26 +401,24 @@ impl MandalaApp {
     /// is real work, and nothing else needs the answer. A few per frame keeps
     /// the queue from being flooded by one enormous folder.
     fn request_missing_durations(&mut self) {
-        if self.settings.sort.key != SortKey::Duration {
-            return;
-        }
         const PER_FRAME: usize = 24;
 
         let mut jobs = Vec::new();
-        for entry in &self.entries {
-            if jobs.len() >= PER_FRAME {
-                break;
-            }
-            if entry.kind != MediaKind::Video
-                || self.durations.contains_key(&entry.path)
+        while jobs.len() < PER_FRAME {
+            let Some(index) = self.unprobed.pop() else { break };
+            let Some(entry) = self.entries.get(index) else { continue };
+            if self.durations.contains_key(&entry.path)
                 || self.requested_durations.contains(&entry.path)
             {
                 continue;
             }
-            jobs.push((
-                entry.path.clone(),
-                Job::Duration { path: entry.path.clone(), meta_key: Self::metadata_key(entry) },
-            ));
+            // A visible tile is already being opened for its thumbnail, and
+            // the length comes back with it; probing as well opens the same
+            // file twice, for exactly the tiles where latency is felt.
+            if self.requested_thumbs.contains(&(entry.path.clone(), self.current_tier)) {
+                continue;
+            }
+            jobs.push((entry.path.clone(), Job::duration(entry)));
         }
         for (path, job) in jobs {
             self.requested_durations.insert(path);
@@ -420,32 +443,30 @@ impl MandalaApp {
         // still the single most useful thing the grid can do.
         let hovered =
             self.hovered.filter(|&i| self.entries.get(i).is_some_and(|e| e.kind.is_playable()));
+        let playing: Vec<usize> = self.player.playing_tiles().collect();
         let wanted = if self.settings.autoplay {
             plan_playback(
                 &candidates,
                 viewport_center_y,
                 hovered,
-                &self.player.holding().into_iter().flatten().collect::<Vec<_>>(),
+                &playing,
                 ScheduleParams { budget: self.settings.budget, ..Default::default() },
             )
         } else {
             hovered.into_iter().collect()
         };
 
-        let mut plan = plan_slots(&self.player.holding(), &wanted);
+        let holding = self.player.holding().to_vec();
+        let mut plan = plan_slots(&holding, &wanted);
         if !settled {
             // Freeing a slot that scrolled away is still worth doing at once;
             // it is only opening new decoders that waits.
             plan.start.clear();
         }
-        if plan.is_empty() {
-            self.player.set_hover(hovered);
-            return;
-        }
 
         for &slot in &plan.stop {
             // The still thumbnail takes over again the moment a tile stops.
-            if let Some(tile) = self.player.holding().get(slot).copied().flatten() {
+            if let Some(tile) = holding.get(slot).copied().flatten() {
                 self.video_textures.remove(&tile);
             }
         }
@@ -461,7 +482,16 @@ impl MandalaApp {
     }
 
     /// Drops textures far enough off screen that scrolling back is unlikely.
+    ///
+    /// Only when the view has actually moved: the keep margin is several rows
+    /// wide, so a still frame has nothing to evict, and sweeping every stored
+    /// texture against its position hashes a path apiece for no result.
     fn trim_textures(&mut self, layout: &GridLayout) {
+        if self.visible == self.trimmed_for {
+            return;
+        }
+        self.trimmed_for = self.visible.clone();
+
         let margin = TEXTURE_KEEP_ROWS * layout.columns();
         let keep_start = self.visible.start.saturating_sub(margin);
         let keep_end = self.visible.end.saturating_add(margin);
@@ -471,7 +501,7 @@ impl MandalaApp {
         });
         // Video textures belong to playing tiles, which are visible by
         // definition; anything else is a leftover from a stopped slot.
-        let playing: HashSet<usize> = self.player.holding().into_iter().flatten().collect();
+        let playing: HashSet<usize> = self.player.playing_tiles().collect();
         self.video_textures.retain(|i, _| playing.contains(i));
         self.playback.retain(|i, _| playing.contains(i));
     }
@@ -529,11 +559,21 @@ impl MandalaApp {
                 ui.checkbox(&mut self.settings.show_labels, "Names");
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let videos = self.entries.iter().filter(|e| e.kind == MediaKind::Video).count();
-                    ui.label(format!("{} items, {videos} video", self.entries.len()));
+                    ui.label(&self.summary);
                 });
             });
         });
+    }
+
+    /// The scrub strip for a tile, if there is anything to scrub.
+    ///
+    /// Returns the bar, the position within the clip, and the clip length. One
+    /// definition for the drawing and the hit-testing: computed separately,
+    /// they drift, and the bar ends up painted where it cannot be clicked.
+    fn seek_bar(&self, index: usize, tile: Rect) -> Option<(Rect, Duration, Duration)> {
+        let info = *self.playback.get(&index)?;
+        let total = info.duration.filter(|d| *d > Duration::ZERO)?;
+        Some((seek_bar_rect(self.image_area(tile)), info.position, total))
     }
 
     fn image_area(&self, tile: Rect) -> Rect {
@@ -578,12 +618,8 @@ impl MandalaApp {
 
         // Only while pointing at it: a permanent bar over every tile would be
         // noise, and the bar is only actionable under the cursor anyway.
-        if hovered
-            && let Some(info) = self.playback.get(&index)
-            && let Some(duration) = info.duration
-            && duration > Duration::ZERO
-        {
-            draw_seek_bar(painter, seek_bar_rect(image_area), info.position, duration, visuals);
+        if hovered && let Some((bar, position, total)) = self.seek_bar(index, rect) {
+            draw_seek_bar(painter, bar, position, total, visuals);
         }
 
         if self.settings.show_labels {
@@ -679,11 +715,7 @@ impl eframe::App for MandalaApp {
                         // The scrub strip sits on top of the tile, so it is claimed
                         // after it and hands hover back to the tile -- otherwise
                         // pointing at the bar would stop the video playing.
-                        if let Some(info) = self.playback.get(&index).copied()
-                            && let Some(duration) = info.duration
-                            && duration > Duration::ZERO
-                        {
-                            let bar = seek_bar_rect(self.image_area(rect));
+                        if let Some((bar, _, total)) = self.seek_bar(index, rect) {
                             let bar_response = ui.interact(
                                 bar,
                                 ui.id().with(("seek", index)),
@@ -694,8 +726,7 @@ impl eframe::App for MandalaApp {
                             }
                             if let Some(pointer) = bar_response.interact_pointer_pos() {
                                 hovering = true;
-                                seek_request =
-                                    Some((index, seek_position(bar, pointer.x, duration)));
+                                seek_request = Some((index, seek_position(bar, pointer.x, total)));
                             }
                         }
 

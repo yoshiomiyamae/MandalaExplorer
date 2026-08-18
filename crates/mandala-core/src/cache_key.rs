@@ -4,6 +4,7 @@
 //! source file changes or the requested size changes -- otherwise a re-encoded
 //! video silently keeps its stale thumbnail.
 
+use crate::scan::Entry;
 use std::path::Path;
 
 /// Bytes of hash kept. 16 bytes is far past the point where collisions matter
@@ -33,6 +34,21 @@ impl CacheKey {
         // Zero is not a real target size, so this cannot collide with a
         // thumbnail key for the same file.
         Self::new(path, mtime_unix_nanos, len, 0)
+    }
+
+    /// Thumbnail key for a scanned entry.
+    ///
+    /// Which fields of an [`Entry`] identify a file, and in what order, is a
+    /// fact about the key rather than about whoever is asking for one. Getting
+    /// it wrong produces no error, just permanent cache misses or a stale
+    /// thumbnail for a re-encoded file.
+    pub fn for_entry(entry: &Entry, target_px: u32) -> Self {
+        Self::new(&entry.path, entry.mtime_unix_nanos(), entry.len, target_px)
+    }
+
+    /// Size-independent key for a scanned entry.
+    pub fn metadata_for(entry: &Entry) -> Self {
+        Self::metadata(&entry.path, entry.mtime_unix_nanos(), entry.len)
     }
 
     pub fn as_str(&self) -> &str {
@@ -92,6 +108,30 @@ mod tests {
         assert_ne!(base, CacheKey::metadata(Path::new("a/c.mp4"), 1, 2));
         assert_ne!(base, CacheKey::metadata(Path::new("a/b.mp4"), 9, 2));
         assert_ne!(base, CacheKey::metadata(Path::new("a/b.mp4"), 1, 9));
+    }
+
+    #[test]
+    fn entry_keys_agree_with_the_fields_they_are_built_from() {
+        use crate::kind::MediaKind;
+        use std::time::{Duration, SystemTime};
+
+        // A whole second, because Windows timestamps land on 100ns boundaries
+        // and a single nanosecond would be rounded away before it was read back.
+        let entry = Entry {
+            path: std::path::PathBuf::from("a/b.mp4"),
+            name: "b.mp4".into(),
+            kind: MediaKind::Video,
+            len: 2,
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+        };
+        let nanos = 1_000_000_000i128;
+        assert_eq!(entry.mtime_unix_nanos(), nanos, "precondition for the keys below");
+
+        assert_eq!(CacheKey::for_entry(&entry, 256), key("a/b.mp4", nanos, 2, 256));
+        assert_eq!(
+            CacheKey::metadata_for(&entry),
+            CacheKey::metadata(Path::new("a/b.mp4"), nanos, 2)
+        );
     }
 
     #[test]

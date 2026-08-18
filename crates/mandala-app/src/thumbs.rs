@@ -7,7 +7,7 @@
 use crate::cache::{CACHE_LIMIT_BYTES, mark_used, sweep};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use mandala_core::{CacheKey, MediaKind};
+use mandala_core::{CacheKey, Entry, MediaKind};
 use mandala_media::{Frame, MediaBackend};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,29 @@ pub enum Job {
     /// Sorting by length has to know about files nobody has looked at yet, and
     /// reading a container header is far cheaper than decoding a poster frame.
     Duration { path: PathBuf, meta_key: CacheKey },
+}
+
+impl Job {
+    /// A thumbnail at a given tier.
+    ///
+    /// Both keys come from the tier here rather than from the caller: passing
+    /// a key for one size and a tier for another would store an N-pixel image
+    /// under the name of an M-pixel one, and poison that file's cache entry
+    /// with no error and nothing to notice short of looking at the pixels.
+    pub fn thumbnail(entry: &Entry, tier: u32) -> Self {
+        Job::Thumbnail {
+            path: entry.path.clone(),
+            kind: entry.kind,
+            key: CacheKey::for_entry(entry, tier),
+            meta_key: CacheKey::metadata_for(entry),
+            tier,
+        }
+    }
+
+    /// Just the running time.
+    pub fn duration(entry: &Entry) -> Self {
+        Job::Duration { path: entry.path.clone(), meta_key: CacheKey::metadata_for(entry) }
+    }
 }
 
 /// What a worker found.
@@ -223,8 +246,6 @@ fn produce(
 ) -> (Result<Frame>, Option<Duration>) {
     let cached = cache_dir.join(key.relative_path("jpg"));
     if let Ok(frame) = load_cached(&cached) {
-        // Records the hit, so eviction can tell live thumbnails from dead ones.
-        mark_used(&cached);
         // The running time was stored separately and outlives any one tier.
         return (Ok(frame), load_duration(cache_dir, meta_key));
     }
@@ -251,14 +272,12 @@ fn produce(
 }
 
 fn load_cached(path: &Path) -> Result<Frame> {
-    let image = image::ImageReader::open(path)?.with_guessed_format()?.decode()?;
-    let (w, h) = (image.width(), image.height());
-    Ok(Frame {
-        width: w,
-        height: h,
-        rgba: image.into_rgba8().into_raw(),
-        timestamp: Duration::ZERO,
-    })
+    let frame = mandala_media::still::load(path)?;
+    // Marking on read is the loader's job. Left to callers, the next reader
+    // added here forgets it, the file keeps an ancient timestamp, and eviction
+    // then takes exactly the thumbnails being used most.
+    mark_used(path);
+    Ok(frame)
 }
 
 fn store_cached(path: &Path, frame: &Frame) -> Result<()> {

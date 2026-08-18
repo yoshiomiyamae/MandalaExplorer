@@ -59,17 +59,17 @@ const JAPANESE: &[Fallback] = &[
     Fallback { file: "msgothic.ttc", name: "japanese", nudge: YU_GOTHIC_NUDGE },
 ];
 
-/// Other scripts, each loaded when present.
+const KOREAN: &[Fallback] = &[Fallback { file: "malgun.ttf", name: "korean", nudge: MALGUN_NUDGE }];
+
+const CHINESE: &[Fallback] = &[Fallback { file: "msyh.ttc", name: "chinese", nudge: YAHEI_NUDGE }];
+
+/// Every script, in fallback order, each as its own list of alternatives.
 ///
-/// Japanese comes first in the fallback chain deliberately. Han characters are
-/// unified in Unicode but drawn differently in Japanese and Chinese, and the
-/// first font holding a glyph is the one that gets used -- so on a Japanese
-/// machine, Japanese shapes should win. Chinese here is what covers the
-/// simplified forms Yu Gothic has no glyph for.
-const OTHER_SCRIPTS: &[Fallback] = &[
-    Fallback { file: "malgun.ttf", name: "korean", nudge: MALGUN_NUDGE },
-    Fallback { file: "msyh.ttc", name: "chinese", nudge: YAHEI_NUDGE },
-];
+/// Japanese comes first deliberately. Han characters are unified in Unicode but
+/// drawn differently in Japanese and Chinese, and the first font holding a
+/// glyph is the one that gets used -- so on a Japanese machine, Japanese shapes
+/// should win. Chinese is here for the simplified forms Yu Gothic lacks.
+const SCRIPTS: &[&[Fallback]] = &[JAPANESE, KOREAN, CHINESE];
 
 /// Loads system fallback fonts into `ctx`.
 ///
@@ -80,13 +80,9 @@ pub fn install_fallbacks(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
     let mut loaded = Vec::new();
 
-    if let Some(japanese) = first_present(dir, JAPANESE)
-        && let Some(name) = load(&mut fonts, dir, japanese)
-    {
-        loaded.push(name);
-    }
-    for fallback in OTHER_SCRIPTS {
-        if dir.join(fallback.file).is_file()
+    // One rule for every script: take the first alternative that loads.
+    for script in SCRIPTS {
+        if let Some(fallback) = first_present(dir, script)
             && let Some(name) = load(&mut fonts, dir, fallback)
         {
             loaded.push(name);
@@ -192,8 +188,17 @@ mod tests {
 
     #[test]
     fn alternatives_for_one_script_share_a_name() {
-        // They replace each other in the font map, so only one can ever load.
-        assert!(JAPANESE.iter().all(|f| f.name == JAPANESE[0].name));
+        // Within a script they replace each other in the font map, so only one
+        // can ever load; across scripts the names must differ or one script
+        // would evict another.
+        for script in SCRIPTS {
+            assert!(script.iter().all(|f| f.name == script[0].name));
+        }
+        let names: Vec<_> = SCRIPTS.iter().map(|s| s[0].name).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(names.len(), unique.len(), "two scripts share a font slot: {names:?}");
     }
 
     #[test]
