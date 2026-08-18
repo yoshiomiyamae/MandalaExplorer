@@ -18,6 +18,12 @@ cargo run --release -p mandala-app -- "C:\some\folder"
 
 With no argument it opens your Pictures folder.
 
+The binary worth keeping is `target\release\mandala.exe`. A debug build
+deliberately keeps a console attached so its logging stays visible, so opening
+`target\debug\mandala.exe` from Explorer brings a terminal window with it. The
+release build has no console, and runs the app code optimised rather than at
+`opt-level = 1`.
+
 ## Controls
 
 | Action | |
