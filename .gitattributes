@@ -1,0 +1,4 @@
+# Git works out text vs binary from content. Text is stored as LF and checked
+# out as LF everywhere, so a file never shows up as rewritten in its entirety
+# just because it was touched on a different platform.
+* text=auto eol=lf
