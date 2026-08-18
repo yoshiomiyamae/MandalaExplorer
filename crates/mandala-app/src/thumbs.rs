@@ -4,6 +4,7 @@
 //! served newest-request-first: when someone flings the scrollbar, the tiles
 //! they are looking at now matter far more than the ones they flew past.
 
+use crate::cache::{CACHE_LIMIT_BYTES, mark_used, sweep};
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use mandala_core::{CacheKey, MediaKind};
@@ -108,6 +109,23 @@ impl ThumbnailService {
         let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let worker_count = parallelism.saturating_sub(2).clamp(2, 8);
 
+        // Sweeping walks the whole cache directory, so it happens once on a
+        // thread of its own rather than blocking the first folder from loading.
+        let sweep_dir = cache_dir.clone();
+        std::thread::Builder::new()
+            .name("mandala-cache-sweep".into())
+            .spawn(move || match sweep(&sweep_dir, CACHE_LIMIT_BYTES) {
+                Ok(report) if report.removed > 0 => eprintln!(
+                    "thumbnail cache: evicted {} of {} files, freeing {} MB",
+                    report.removed,
+                    report.files,
+                    report.freed / (1024 * 1024)
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("thumbnail cache sweep failed: {e}"),
+            })
+            .ok();
+
         let workers = (0..worker_count)
             .map(|_| {
                 let queue = Arc::clone(&queue);
@@ -159,6 +177,8 @@ impl Drop for ThumbnailService {
 fn produce(request: &ThumbnailRequest, cache_dir: &Path, backend: &impl MediaBackend) -> Result<Frame> {
     let cached = cache_dir.join(request.key.relative_path("jpg"));
     if let Ok(frame) = load_cached(&cached) {
+        // Records the hit, so eviction can tell live thumbnails from dead ones.
+        mark_used(&cached);
         return Ok(frame);
     }
 

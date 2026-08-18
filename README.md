@@ -67,6 +67,14 @@ then whatever is nearest the middle of the screen. Tiles that keep their slot
 across a scroll keep playing without restarting, and video is decoded no larger
 than the tile can actually show.
 
+**The cache is capped.** Thumbnails live in
+`%LOCALAPPDATA%\mandala\thumbnails`, sharded by hash so no directory holds a
+hundred thousand entries, and keyed on path, size, modification time and size
+tier -- so a re-encoded video cannot keep a stale thumbnail. The cap is 2 GB,
+enforced on startup by evicting whatever has gone longest unused. Cache hits
+refresh that timestamp at most once a day, which is enough to tell a live
+thumbnail from a dead one without a metadata write per hit.
+
 ## Tests
 
 ```
