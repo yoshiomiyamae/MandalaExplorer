@@ -34,11 +34,16 @@ fn main() -> anyhow::Result<()> {
 
     let mut frames: Vec<PathBuf> = std::fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
+        .filter(|p| {
+            // BMP is what the capture writes: PNG compression costs more than
+            // the screen grab itself and halves the achievable frame rate.
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("bmp") || e.eq_ignore_ascii_case("png"))
+        })
         .collect();
     frames.sort();
     if frames.is_empty() {
-        anyhow::bail!("no PNG frames in {}", dir.display());
+        anyhow::bail!("no BMP or PNG frames in {}", dir.display());
     }
 
     let stamps = read_timestamps(&dir.join("timestamps.txt"), frames.len())?;
