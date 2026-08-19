@@ -7,6 +7,7 @@
 mod app;
 mod cache;
 mod fonts;
+mod lang;
 mod player;
 mod thumbs;
 

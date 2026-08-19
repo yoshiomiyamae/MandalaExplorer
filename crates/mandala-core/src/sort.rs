@@ -37,16 +37,6 @@ impl SortKey {
     pub fn needs_probe(self) -> bool {
         matches!(self, SortKey::Duration)
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            SortKey::Name => "Name",
-            SortKey::Kind => "Type",
-            SortKey::Size => "Size",
-            SortKey::Modified => "Modified",
-            SortKey::Duration => "Length",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

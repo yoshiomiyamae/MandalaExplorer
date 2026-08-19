@@ -1,6 +1,7 @@
 //! The application shell: navigation, the tile grid, and the loop that keeps
 //! thumbnails and playback pointed at whatever is on screen.
 
+use crate::lang::{Language, Phrase};
 use crate::player::{PlaybackService, SlotEvent};
 use crate::thumbs::{Job, ThumbnailService, thumbnail_tier};
 use eframe::egui::{
@@ -152,6 +153,9 @@ pub struct MandalaApp {
     /// Where each playing tile has got to, for drawing its seek bar.
     playback: HashMap<usize, PlaybackInfo>,
 
+    /// Which language the interface speaks, taken from Windows at startup.
+    lang: Language,
+
     hovered: Option<usize>,
     visible: std::ops::Range<usize>,
     /// The visible range the last texture sweep was made for.
@@ -210,6 +214,7 @@ impl MandalaApp {
             applied_sort,
             needs_resort: false,
             playback: HashMap::new(),
+            lang: Language::from_system(),
             hovered: None,
             visible: 0..0,
             trimmed_for: 0..0,
@@ -306,7 +311,7 @@ impl MandalaApp {
 
     fn describe_contents(&self) -> String {
         let videos = self.entries.iter().filter(|e| e.kind == MediaKind::Video).count();
-        format!("{} items, {videos} video", self.entries.len())
+        self.lang.item_summary(self.entries.len(), videos)
     }
 
     /// Notices the tile size crossing into another thumbnail tier.
@@ -522,7 +527,10 @@ impl MandalaApp {
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let parent = self.parent_dir();
-                if ui.add_enabled(parent.is_some(), egui::Button::new("↑")).clicked()
+                let up = ui
+                    .add_enabled(parent.is_some(), egui::Button::new("↑"))
+                    .on_hover_text(self.lang.text(Phrase::UpOneLevel));
+                if up.clicked()
                     && let Some(parent) = parent
                 {
                     self.navigate_to(parent);
@@ -537,7 +545,7 @@ impl MandalaApp {
             });
 
             ui.horizontal(|ui| {
-                ui.label("Size");
+                ui.label(self.lang.text(Phrase::Size));
                 ui.add(
                     egui::Slider::new(&mut self.settings.tile_px, MIN_TILE_PX..=MAX_TILE_PX)
                         .show_value(false)
@@ -545,30 +553,36 @@ impl MandalaApp {
                 );
                 ui.separator();
 
-                ui.checkbox(&mut self.settings.autoplay, "Autoplay");
-                ui.label("at once");
+                ui.checkbox(&mut self.settings.autoplay, self.lang.text(Phrase::Autoplay));
+                ui.label(self.lang.text(Phrase::AtOnce));
                 ui.add(egui::Slider::new(&mut self.settings.budget, 1..=MAX_BUDGET));
                 ui.separator();
 
-                ui.label("Sort");
+                ui.label(self.lang.text(Phrase::Sort));
+                let lang = self.lang;
                 egui::ComboBox::from_id_salt("sort-key")
-                    .selected_text(self.settings.sort.key.label())
-                    .width(90.0)
+                    .selected_text(lang.sort_key(self.settings.sort.key))
+                    .width(110.0)
                     .show_ui(ui, |ui| {
                         for key in SortKey::ALL {
-                            ui.selectable_value(&mut self.settings.sort.key, key, key.label());
+                            ui.selectable_value(
+                                &mut self.settings.sort.key,
+                                key,
+                                lang.sort_key(key),
+                            );
                         }
                     });
-                let (arrow, tip) = match self.settings.sort.order {
-                    SortOrder::Ascending => ("\u{2191}", "Ascending"),
-                    SortOrder::Descending => ("\u{2193}", "Descending"),
+                let arrow = match self.settings.sort.order {
+                    SortOrder::Ascending => "\u{2191}",
+                    SortOrder::Descending => "\u{2193}",
                 };
+                let tip = lang.sort_order(self.settings.sort.order);
                 if ui.button(arrow).on_hover_text(tip).clicked() {
                     self.settings.sort.order = self.settings.sort.order.flipped();
                 }
 
                 ui.separator();
-                ui.checkbox(&mut self.settings.show_labels, "Names");
+                ui.checkbox(&mut self.settings.show_labels, self.lang.text(Phrase::Names));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.summary);

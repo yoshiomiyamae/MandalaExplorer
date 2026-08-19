@@ -22,6 +22,9 @@ image.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Globalization"] }
+
 [dev-dependencies]
 filetime = "0.2"
 ron = "0.12"

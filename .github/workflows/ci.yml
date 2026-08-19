@@ -18,13 +18,18 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      # Caches the registry and the dependency half of target/, which is most
+      # of the build: the first run took 25 minutes cold. Saved even when a
+      # step fails, so a red clippy run does not make the next one start over.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Format
         run: cargo fmt --check
@@ -42,7 +47,7 @@ jobs:
       - name: Build
         run: cargo build --release -p mandala-app
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mandala
           path: target/release/mandala.exe
