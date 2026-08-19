@@ -24,7 +24,10 @@ const W: u32 = 1280;
 const H: u32 = 720;
 
 /// Names that read as a photo library rather than as generated files.
-const NAMES: &[&str] = &[
+///
+/// Enough of them that the grid scrolls at a sensible tile size: a trailer that
+/// fits its whole folder on one screen has nothing to demonstrate.
+const STEMS: &[&str] = &[
     "aurora", "beacon", "cascade", "drift", "ember", "flux", "glimmer", "harbour", "isle", "jetty",
     "kelp", "lantern", "meridian", "nocturne", "opal", "prism", "quarry", "ripple", "solstice",
     "tide", "umbra", "vellum", "willow", "zephyr",
@@ -37,10 +40,24 @@ fn pack(a: u32, b: u32) -> u64 {
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().unwrap_or_else(|| "demo".into()));
+    let count: usize = args.next().and_then(|n| n.parse().ok()).unwrap_or(STEMS.len());
     std::fs::create_dir_all(&dir)?;
-    println!("writing {} items to {}", NAMES.len(), dir.display());
+    println!("writing {count} items to {}", dir.display());
 
-    for (i, name) in NAMES.iter().enumerate() {
+    // Stems repeat with a numeric suffix once they run out, so a larger demo
+    // folder still reads as a library rather than as a list of test files.
+    let names: Vec<String> = (0..count)
+        .map(|i| {
+            let stem = STEMS[i % STEMS.len()];
+            if i < STEMS.len() {
+                stem.to_owned()
+            } else {
+                format!("{stem}-{:02}", i / STEMS.len() + 1)
+            }
+        })
+        .collect();
+
+    for (i, name) in names.iter().enumerate() {
         let seed = i as u32;
         // Two clips for every still, since playing video is the thing being
         // demonstrated.

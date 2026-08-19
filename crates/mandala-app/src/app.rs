@@ -505,10 +505,12 @@ impl MandalaApp {
         let margin = TEXTURE_KEEP_ROWS * layout.columns();
         let keep_start = self.visible.start.saturating_sub(margin);
         let keep_end = self.visible.end.saturating_add(margin);
-        let positions = &self.path_to_tile;
-        self.thumb_textures.retain(|path, _| {
-            positions.get(path).is_some_and(|&i| i >= keep_start && i < keep_end)
-        });
+        evict_thumbnails(
+            &mut self.thumb_textures,
+            &mut self.requested_thumbs,
+            &self.path_to_tile,
+            keep_start..keep_end,
+        );
         // Video textures belong to playing tiles, which are visible by
         // definition; anything else is a leftover from a stopped slot.
         let playing: HashSet<usize> = self.player.playing_tiles().collect();
@@ -773,6 +775,31 @@ impl eframe::App for MandalaApp {
     }
 }
 
+/// Drops thumbnails outside the keep window, and forgets they were asked for.
+///
+/// The two have to move together. A texture dropped while its request record
+/// stays behind is never asked for again -- nothing retries a request that is
+/// already recorded -- so the tile falls back to a placeholder and stays there
+/// for the rest of the session, however many times it scrolls back into view.
+fn evict_thumbnails<T>(
+    textures: &mut HashMap<PathBuf, T>,
+    requested: &mut HashSet<(PathBuf, u32)>,
+    positions: &HashMap<PathBuf, usize>,
+    keep: std::ops::Range<usize>,
+) {
+    let mut evicted = Vec::new();
+    textures.retain(|path, _| {
+        let inside = positions.get(path).is_some_and(|i| keep.contains(i));
+        if !inside {
+            evicted.push(path.clone());
+        }
+        inside
+    });
+    // Only for what actually had a texture: a request still in flight has none
+    // yet, and forgetting it would queue the same work twice.
+    requested.retain(|(path, _)| !evicted.contains(path));
+}
+
 /// Whether any entry sits somewhere other than where `positions` had it.
 fn order_changed(entries: &[Entry], positions: &HashMap<PathBuf, usize>) -> bool {
     entries.len() != positions.len()
@@ -920,6 +947,74 @@ mod tests {
                 modified: None,
             })
             .collect()
+    }
+
+    /// Textures, the requests that produced them, and where each file sits.
+    type Evictable = (HashMap<PathBuf, ()>, HashSet<(PathBuf, u32)>, HashMap<PathBuf, usize>);
+
+    fn evictable() -> Evictable {
+        let paths: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("f{i}.png"))).collect();
+        let textures = paths.iter().map(|p| (p.clone(), ())).collect();
+        let requested = paths.iter().map(|p| (p.clone(), 256u32)).collect();
+        let positions = paths.iter().cloned().enumerate().map(|(i, p)| (p, i)).collect();
+        (textures, requested, positions)
+    }
+
+    #[test]
+    fn eviction_keeps_what_is_inside_the_window() {
+        let (mut textures, mut requested, positions) = evictable();
+        evict_thumbnails(&mut textures, &mut requested, &positions, 3..7);
+
+        assert_eq!(textures.len(), 4);
+        assert!(textures.contains_key(&PathBuf::from("f3.png")));
+        assert!(textures.contains_key(&PathBuf::from("f6.png")));
+        assert!(!textures.contains_key(&PathBuf::from("f2.png")));
+    }
+
+    #[test]
+    fn eviction_also_forgets_that_it_asked() {
+        // The bug this exists for: dropping a texture while keeping its request
+        // record means the tile is never asked for again, and shows a
+        // placeholder for the rest of the session however often it comes back.
+        let (mut textures, mut requested, positions) = evictable();
+        evict_thumbnails(&mut textures, &mut requested, &positions, 3..7);
+
+        for i in [0, 1, 2, 7, 8, 9] {
+            let path = PathBuf::from(format!("f{i}.png"));
+            assert!(
+                !requested.contains(&(path.clone(), 256)),
+                "{} was evicted but is still recorded as requested",
+                path.display()
+            );
+        }
+        for i in 3..7 {
+            let path = PathBuf::from(format!("f{i}.png"));
+            assert!(requested.contains(&(path, 256)), "a kept thumbnail lost its record");
+        }
+    }
+
+    #[test]
+    fn eviction_leaves_requests_that_have_not_arrived_yet() {
+        // In flight means no texture yet. Forgetting those would queue the same
+        // work a second time on the very next frame.
+        let (mut textures, mut requested, positions) = evictable();
+        let pending = PathBuf::from("f5.png");
+        textures.remove(&pending);
+
+        evict_thumbnails(&mut textures, &mut requested, &positions, 3..7);
+        assert!(requested.contains(&(pending, 256)), "an in-flight request was dropped");
+    }
+
+    #[test]
+    fn eviction_drops_thumbnails_for_files_that_are_gone() {
+        // A path with no position no longer exists in this folder at all.
+        let (mut textures, mut requested, mut positions) = evictable();
+        let vanished = PathBuf::from("f4.png");
+        positions.remove(&vanished);
+
+        evict_thumbnails(&mut textures, &mut requested, &positions, 0..10);
+        assert!(!textures.contains_key(&vanished));
+        assert!(!requested.contains(&(vanished, 256)));
     }
 
     #[test]
