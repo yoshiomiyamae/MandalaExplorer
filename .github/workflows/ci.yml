@@ -1,9 +1,12 @@
 name: CI
 
 on:
-  # Only the default branch, because an unfiltered push trigger runs a second
-  # time for every branch that also has a pull request open -- twice the wait
-  # and, on a Windows runner, twice the minutes.
+  # Only the default branch. An unfiltered push trigger fires again for every
+  # branch that has a pull request open, so the same commit is built twice:
+  # two identical runs and two results to read. It costs nothing in money --
+  # standard runners are free for public repositories, billable minutes on a
+  # run here come back empty -- but the duplicates compete for the same
+  # concurrent-job allowance, and pull_request already covers work in progress.
   push:
     branches: [main]
   pull_request:
