@@ -12,6 +12,14 @@ mod thumbs;
 
 use std::path::PathBuf;
 
+/// Shown in the title bar and the taskbar. Matches the name reserved in the
+/// Store and the DisplayName in packaging/AppxManifest.xml -- an installed app
+/// whose window disagrees with its Start menu entry looks like two programs.
+///
+/// Also what eframe derives its settings directory from, so changing it starts
+/// the settings over. Worth it once, to stop the two names disagreeing.
+const APP_NAME: &str = "Mandala Explorer";
+
 fn main() -> eframe::Result {
     let start = std::env::args()
         .nth(1)
@@ -25,12 +33,15 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([480.0, 320.0])
-            .with_title("mandala"),
+            .with_title(APP_NAME)
+            // Ties the window to the installed package, so the taskbar groups
+            // it under the Store entry rather than as a stray executable.
+            .with_app_id("FamoceSuccellion.MandalaExplorer"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "mandala",
+        APP_NAME,
         options,
         Box::new(|cc| Ok(Box::new(app::MandalaApp::new(cc, start)?))),
     )
