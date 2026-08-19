@@ -1,0 +1,21 @@
+# Dependency updates, opened as pull requests so CI decides whether they land.
+#
+# The actions ecosystem is here because it has already gone stale once without
+# anyone noticing: the workflow sat on actions/checkout@v4 while v7 was current.
+# Cargo is grouped into a single pull request a week rather than one per crate,
+# because a workspace this size would otherwise produce more review than value.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns:
+          - "*"

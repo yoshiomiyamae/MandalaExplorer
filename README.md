@@ -1,9 +1,9 @@
-# mandala
+# Mandala Explorer
 
 A file browser for folders full of pictures and video.
 
 Ordinary explorers treat a photo the same way they treat a spreadsheet: a tiny
-icon and a filename. mandala goes the other way. Thumbnails are as large as you
+icon and a filename. Mandala Explorer goes the other way. Thumbnails are as large as you
 want them, and videos play inline in their tiles, several at once, so a folder
 can be read at a glance instead of opened one file at a time.
 
@@ -142,3 +142,10 @@ row orientation -- the two things that fail silently and look almost right.
 Those tests also cover seeking, and assert that opening many distinct files in
 parallel does not leak threads, which is the failure mode a browser of large
 folders would otherwise hit only in front of a user.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
+
+Security reports go to the address in [SECURITY.md](SECURITY.md); what the app
+stores, and what it does not, is in [PRIVACY.md](PRIVACY.md).
