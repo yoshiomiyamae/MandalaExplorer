@@ -1,8 +1,10 @@
 //! Verifies a finished trailer against what the Store requires.
 #![cfg(windows)]
 use mandala_media::backend::{Advance, MediaBackend};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use windows::Win32::Media::MediaFoundation::*;
+use windows::core::HSTRING;
 
 fn main() -> anyhow::Result<()> {
     let path = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "trailer.mp4".into()));
@@ -43,10 +45,36 @@ fn main() -> anyhow::Result<()> {
     }
     println!("decoded   {frames} sample points to the end without error");
 
+    // The Store rejects a trailer whose audio is not stereo or surround, and
+    // counts no audio at all as the same fault.
+    let channels = audio_channels(&path)?;
+    match channels {
+        Some(n) => println!("audio     {n} channels   (Store requires 2 or more)"),
+        None => println!("audio     none   (Store requires stereo or surround)"),
+    }
+
     let ok = first.width == 1920
         && first.height == 1080
         && bytes < 2 * 1024 * 1024 * 1024
-        && duration.is_some_and(|d| d <= Duration::from_secs(60));
+        && duration.is_some_and(|d| d <= Duration::from_secs(60))
+        && channels.is_some_and(|n| n >= 2);
     println!("\n{}", if ok { "PASS" } else { "FAILS a Store requirement" });
+    if !ok {
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// Channels on the file's first audio stream, or `None` if it has none.
+fn audio_channels(path: &Path) -> anyhow::Result<Option<u32>> {
+    unsafe {
+        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
+        let index = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+        // A file without an audio stream fails to describe one, which is the
+        // answer rather than an error.
+        let Ok(media_type) = reader.GetCurrentMediaType(index) else {
+            return Ok(None);
+        };
+        Ok(media_type.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).ok())
+    }
 }

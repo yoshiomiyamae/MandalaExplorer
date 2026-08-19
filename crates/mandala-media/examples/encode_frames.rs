@@ -23,6 +23,17 @@ const FRAME_HNS: i64 = 10_000_000 / FPS as i64;
 const W: u32 = 1920;
 const H: u32 = 1080;
 
+/// The app makes no sound and the trailer has nothing to say, but the Store
+/// rejects a clip whose audio is not stereo or surround -- and counts no audio
+/// at all as that same fault. So the file carries silence, in stereo.
+const AUDIO_HZ: u32 = 48_000;
+const AUDIO_CHANNELS: u32 = 2;
+const AUDIO_BITS: u32 = 16;
+const AUDIO_BLOCK: u32 = AUDIO_CHANNELS * AUDIO_BITS / 8;
+/// Written a tenth of a second at a time: small enough that the last chunk
+/// lands close to the final video frame, large enough not to be all overhead.
+const AUDIO_CHUNK_HNS: i64 = 1_000_000;
+
 fn pack(a: u32, b: u32) -> u64 {
     ((a as u64) << 32) | b as u64
 }
@@ -81,11 +92,34 @@ fn main() -> anyhow::Result<()> {
         source.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
         source.SetUINT32(&MF_MT_DEFAULT_STRIDE, W * 4)?;
         writer.SetInputMediaType(stream, &source, None)?;
+
+        let audio_target = MFCreateMediaType()?;
+        audio_target.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        audio_target.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+        audio_target.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
+        audio_target.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_HZ)?;
+        audio_target.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS)?;
+        // 96 kbit/s. Silence compresses to nothing whatever this says; the
+        // encoder simply wants a rate it recognises.
+        audio_target.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 12_000)?;
+        let audio_stream = writer.AddStream(&audio_target)?;
+
+        let audio_source = MFCreateMediaType()?;
+        audio_source.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        audio_source.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+        audio_source.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
+        audio_source.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_HZ)?;
+        audio_source.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, AUDIO_BITS)?;
+        audio_source.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_BLOCK)?;
+        audio_source.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AUDIO_HZ * AUDIO_BLOCK)?;
+        writer.SetInputMediaType(audio_stream, &audio_source, None)?;
+
         writer.BeginWriting()?;
 
         let bytes = (W * H * 4) as usize;
         let mut cursor = 0usize;
         let mut loaded: Option<(usize, Vec<u8>)> = None;
+        let mut silence_at = 0i64;
 
         for index in 0..output_frames {
             let want = index as f64 / FPS as f64;
@@ -113,6 +147,14 @@ fn main() -> anyhow::Result<()> {
             sample.SetSampleDuration(FRAME_HNS)?;
             writer.WriteSample(stream, &sample)?;
 
+            // Keep the silence level with the picture. The sink writer holds
+            // every sample it cannot yet interleave, so writing the whole
+            // audio track afterwards means keeping all 1100-odd uncompressed
+            // frames in memory at once -- which is what an earlier version did,
+            // and it never finished.
+            let until = (index as i64 + 1) * FRAME_HNS;
+            write_silence(&writer, audio_stream, &mut silence_at, until)?;
+
             if index % 60 == 0 {
                 print!(".");
                 use std::io::Write;
@@ -124,6 +166,35 @@ fn main() -> anyhow::Result<()> {
 
     let size = std::fs::metadata(&out)?.len();
     println!("\nwrote {} ({:.1} MB)", out.display(), size as f64 / (1024.0 * 1024.0));
+    Ok(())
+}
+
+/// Extends the silent track from `at` up to `until`, moving `at` as it goes.
+unsafe fn write_silence(
+    writer: &IMFSinkWriter,
+    stream: u32,
+    at: &mut i64,
+    until: i64,
+) -> anyhow::Result<()> {
+    while *at < until {
+        let span = AUDIO_CHUNK_HNS.min(until - *at);
+        let bytes = (span as u64 * (AUDIO_HZ * AUDIO_BLOCK) as u64 / 10_000_000) as u32;
+        if bytes < AUDIO_BLOCK {
+            break;
+        }
+        unsafe {
+            let buffer = MFCreateMemoryBuffer(bytes)?;
+            // A fresh buffer is already zeroed, and zero is silence in signed
+            // PCM, so there is nothing to fill in.
+            buffer.SetCurrentLength(bytes)?;
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            sample.SetSampleTime(*at)?;
+            sample.SetSampleDuration(span)?;
+            writer.WriteSample(stream, &sample)?;
+        }
+        *at += span;
+    }
     Ok(())
 }
 
