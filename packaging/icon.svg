@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!--
+    Mandala Explorer's icon: a grid of tiles arranged as a mandala, which is
+    what the app puts on screen.
+
+    Built to survive being drawn at 16px. Everything is on a 16px grid at this
+    256px master size, there are only three tile sizes, and the gaps are wide
+    enough that neighbouring tiles do not merge into one blob when the whole
+    thing is a sixteenth of its drawn size. The centre tile is the accent, so
+    that even when every other tile has collapsed into texture there is still
+    one recognisable shape in the middle.
+  -->
+  <defs>
+    <linearGradient id="warm" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f0a63c"/>
+      <stop offset="1" stop-color="#e2622e"/>
+    </linearGradient>
+    <linearGradient id="cool" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4ea8de"/>
+      <stop offset="1" stop-color="#3a6ea5"/>
+    </linearGradient>
+    <linearGradient id="deep" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7c5cbf"/>
+      <stop offset="1" stop-color="#4c3a8c"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Corner tiles: the outermost ring, smallest and coolest. -->
+  <g fill="url(#cool)">
+    <rect x="24" y="24" width="40" height="40" rx="8"/>
+    <rect x="192" y="24" width="40" height="40" rx="8"/>
+    <rect x="24" y="192" width="40" height="40" rx="8"/>
+    <rect x="192" y="192" width="40" height="40" rx="8"/>
+  </g>
+
+  <!-- Edge tiles: the four cardinal positions, mid-sized. -->
+  <g fill="url(#deep)">
+    <rect x="104" y="16" width="48" height="48" rx="9"/>
+    <rect x="104" y="192" width="48" height="48" rx="9"/>
+    <rect x="16" y="104" width="48" height="48" rx="9"/>
+    <rect x="192" y="104" width="48" height="48" rx="9"/>
+  </g>
+
+  <!-- Inner ring: four tiles closing in on the centre. -->
+  <g fill="url(#cool)">
+    <rect x="72" y="72" width="44" height="44" rx="9"/>
+    <rect x="140" y="72" width="44" height="44" rx="9"/>
+    <rect x="72" y="140" width="44" height="44" rx="9"/>
+    <rect x="140" y="140" width="44" height="44" rx="9"/>
+  </g>
+
+  <!-- The centre: the one shape that has to read at every size. -->
+  <rect x="98" y="98" width="60" height="60" rx="12" fill="url(#warm)"/>
+</svg>

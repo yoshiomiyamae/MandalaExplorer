@@ -46,6 +46,32 @@ chosen -- a folder is somewhere to go, not something to compare against the
 files beside it, and reversing "largest first" should not bury the way back out
 at the bottom of the grid.
 
+## Packaging
+
+```
+.\packaginguild-msix.ps1 -Version 0.1.0.0
+```
+
+Builds `target\msix\MandalaExplorer.msix`, unsigned, which is what the Store
+wants -- it signs submissions itself. The icons are drawn by
+`packaging/make_assets.py` from one description rather than checked in, so all
+77 of them stay consistent and the repository holds no binaries.
+
+Add `-Sign` to sign with a self-signed certificate and install it locally
+first. Windows will not install it until that certificate is trusted, which
+needs an elevated shell:
+
+```
+Export-Certificate -Cert Cert:\CurrentUser\My\<thumbprint> -FilePath test.cer
+Import-Certificate -FilePath test.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople
+Add-AppxPackage target\msix\MandalaExplorer.msix
+```
+
+The script prints the thumbprint when it creates the certificate. The
+certificate's subject has to match the manifest's `Publisher` exactly or the
+install fails with an error that does not say so, which is why the script reads
+it out of the manifest rather than repeating it.
+
 ## How it is put together
 
 | Crate | |
