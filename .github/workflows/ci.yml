@@ -1,9 +1,26 @@
 name: CI
 
 on:
+  # Only the default branch, because an unfiltered push trigger runs a second
+  # time for every branch that also has a pull request open -- twice the wait
+  # and, on a Windows runner, twice the minutes.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Least privilege, declared here rather than relied on from the repository
+# setting: a fork inherits the file but not the setting, and a setting can be
+# changed later without anyone rereading this workflow. Nothing here writes to
+# the repository.
+permissions:
+  contents: read
+
+# A superseded run is wasted work. Runs on the default branch are left alone,
+# so every commit that lands keeps its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
