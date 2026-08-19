@@ -170,7 +170,11 @@ struct PlaybackInfo {
 }
 
 impl MandalaApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, start: PathBuf) -> anyhow::Result<Self> {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        start: PathBuf,
+        lang: Language,
+    ) -> anyhow::Result<Self> {
         // Before anything draws, or the first frame is all boxes.
         crate::fonts::install_fallbacks(&cc.egui_ctx);
 
@@ -214,7 +218,7 @@ impl MandalaApp {
             applied_sort,
             needs_resort: false,
             playback: HashMap::new(),
-            lang: Language::from_system(),
+            lang,
             hovered: None,
             visible: 0..0,
             trimmed_for: 0..0,
