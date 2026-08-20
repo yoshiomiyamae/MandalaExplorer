@@ -7,6 +7,7 @@
 //! keeps that work off the CPU and means a full-size frame is never touched.
 
 pub mod d3d;
+mod gpu;
 
 use crate::backend::{Advance, MediaBackend, VideoStream, VideoThumbnail, thumbnail_timestamp};
 use crate::com::ensure_thread_com;
@@ -139,6 +140,12 @@ struct MfStream {
     at_end: bool,
     /// Whether the negotiated output needs its red and blue channels swapped.
     swap_rb: bool,
+    /// Present when frames arrive as textures and are converted on the GPU.
+    ///
+    /// The fast path, and the only one that keeps the hardware decoder: asking
+    /// Media Foundation for a frame in system memory is what makes it give the
+    /// decoder up. See `gpu` for the measurements.
+    gpu: Option<gpu::Converter>,
 }
 
 // The reader is created without MF_SOURCE_READER_ASYNC_CALLBACK, so it is only
@@ -150,6 +157,75 @@ impl MfStream {
         ensure_startup()?;
         ensure_thread_com();
 
+        // Decoding into a texture is worth eight times the frames for a
+        // twenty-sixth of the processor, so it is tried first and the older
+        // path is what remains when there is no device to decode onto: a
+        // remote desktop session, a stripped-down virtual machine, a driver
+        // that has just been replaced.
+        if let Some(device) = d3d::shared_device()
+            && let Ok(stream) = Self::open_on_gpu(path, max, &device)
+        {
+            return Ok(stream);
+        }
+        Self::open_in_system_memory(path, max)
+    }
+
+    /// Opens a stream whose frames stay on the GPU until they are tile-sized.
+    fn open_on_gpu(path: &Path, max: (u32, u32), device: &d3d::SharedDevice) -> Result<Self> {
+        unsafe {
+            let mut attributes: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut attributes, 1)?;
+            let attributes =
+                attributes.ok_or_else(|| anyhow!("MFCreateAttributes returned nothing"))?;
+            // Deliberately no MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING:
+            // it exists to convert and scale into system memory, which is the
+            // one thing that must not happen here.
+            attributes.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, device.manager())?;
+
+            let url = HSTRING::from(path.as_os_str());
+            let reader = MFCreateSourceReaderFromURL(&url, &attributes)
+                .with_context(|| format!("opening {}", path.display()))?;
+            reader.SetStreamSelection(ALL_STREAMS, false)?;
+            reader.SetStreamSelection(VIDEO_STREAM, true)?;
+
+            let native = reader
+                .GetNativeMediaType(VIDEO_STREAM, 0)
+                .with_context(|| format!("no video stream in {}", path.display()))?;
+            let native_size = unpack_size(native.GetUINT64(&MF_MT_FRAME_SIZE)?);
+            let size = fit_within(native_size, max);
+
+            // The decoder's own format at its own size. Anything else invites
+            // a converter into the pipeline, and a converter that has to reach
+            // system memory takes the decoder down with it.
+            let output = MFCreateMediaType()?;
+            native.CopyAllItems(&output)?;
+            output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+            reader
+                .SetCurrentMediaType(VIDEO_STREAM, None, &output)
+                .context("the decoder will not produce NV12 for this file")?;
+
+            let converter = gpu::Converter::new(device.device(), native_size, size)?;
+            let duration = read_duration(&reader);
+
+            Ok(Self {
+                reader,
+                size,
+                duration,
+                last_timestamp: None,
+                at_end: false,
+                swap_rb: false,
+                gpu: Some(converter),
+            })
+        }
+    }
+
+    /// Opens a stream that asks Media Foundation for finished pixels.
+    ///
+    /// Slower by a lot, and the reason is worth stating: a frame in system
+    /// memory is not something a hardware decoder can produce, so asking for
+    /// one moves the decode onto the processor. It stays because it works
+    /// where there is no usable Direct3D device at all.
+    fn open_in_system_memory(path: &Path, max: (u32, u32)) -> Result<Self> {
         unsafe {
             let mut attributes: Option<IMFAttributes> = None;
             MFCreateAttributes(&mut attributes, 1)?;
@@ -187,7 +263,15 @@ impl MfStream {
             let size = unpack_size(actual.GetUINT64(&MF_MT_FRAME_SIZE)?);
             let duration = read_duration(&reader);
 
-            Ok(Self { reader, size, duration, last_timestamp: None, at_end: false, swap_rb })
+            Ok(Self {
+                reader,
+                size,
+                duration,
+                last_timestamp: None,
+                at_end: false,
+                swap_rb,
+                gpu: None,
+            })
         }
     }
 
@@ -239,6 +323,14 @@ impl MfStream {
 
     /// Copies a sample into an RGBA frame.
     unsafe fn convert(&self, sample: &IMFSample, timestamp: Duration) -> Result<Frame> {
+        // A stream can stop producing textures partway through, so this asks
+        // rather than assuming: a converter handed a system-memory buffer
+        // would fail on every frame from then on.
+        if let Some(gpu) = &self.gpu
+            && gpu::Converter::accepts(sample)
+        {
+            return gpu.convert(sample, timestamp);
+        }
         unsafe {
             let buffer = sample.ConvertToContiguousBuffer()?;
 
