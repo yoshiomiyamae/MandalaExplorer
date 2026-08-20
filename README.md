@@ -92,12 +92,27 @@ will never read. Playback only starts once the view has held still briefly --
 which measurably cut thread count and memory during scrolling, and reads better
 too, since tiles stop flickering in and out of playback as you move.
 
-**Decoding belongs on the GPU.** A Source Reader with no D3D11 device manager
-attached silently picks a software decoder, which costs a whole CPU core for a
-dozen small tiles. Handing it a shared device moved that onto the GPU's decode
-block, and asking the video processor for RGBA rather than BGRA removed a
-channel swap that ran over every pixel of every frame. Together those took
-twelve simultaneous videos from 94% of a core to 20%.
+**Decoding belongs on the GPU, and so does everything after it.** A Source
+Reader with no D3D11 device manager attached silently picks a software decoder,
+which costs a whole CPU core for a dozen small tiles. Handing it a shared device
+moved that onto the GPU's decode block, and took twelve simultaneous videos from
+94% of a core to 20%.
+
+That was not the end of it. Asking Media Foundation for a finished frame *in
+system memory* -- any format, scaled or not -- makes the pipeline give the
+hardware decoder up again, because a frame in system memory is not something a
+hardware decoder can produce. The reader will still oblige, quietly, on the
+processor. On a 3840x2160 60fps HEVC clip that cost ten cores for 32 frames a
+second per stream. Taking the decoder's own texture instead, and doing the
+scale and the colour conversion with a Direct3D video processor before reading
+back only the finished tile, gives 131 frames a second per stream for three
+tenths of one core: eight times the frames for a thirty-seventh of the
+processor. Three such clips play together in 0.18 of a core.
+
+What crosses the bus is the tile, a megabyte, rather than the 4K frame it came
+from. The older path is still there for machines with no usable device -- a
+remote desktop session, a stripped-down VM -- where slow and correct beats
+nothing.
 
 **Playback is a budget, not a free-for-all.** Every playing video costs a
 decoder, a thread, and GPU decode capacity, so a fixed number of slots is handed

@@ -36,6 +36,13 @@ impl SharedDevice {
         &self.manager
     }
 
+    /// The device itself, for work that has to happen on the same one the
+    /// decoder is using -- converting a decoded texture, above all, which is
+    /// only free while the frame stays where the decoder left it.
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
     /// Whether the driver still has this device.
     ///
     /// Devices are lost for reasons that have nothing to do with this app: a
