@@ -228,11 +228,35 @@ struct Playing {
     started: Instant,
     interval: Duration,
     next_frame_due: Instant,
+    /// Where in the clip the last frame handed to the UI sat.
+    shown: Duration,
 }
 
 impl Playing {
+    /// The position to ask the decoder for next.
+    ///
+    /// Two limits, and the second is the one that matters. Never ahead of the
+    /// wall clock, so a clip that decodes faster than real time still plays at
+    /// its own speed rather than as fast as the machine can manage. And never
+    /// more than a frame past what was last shown, so a clip that decodes
+    /// *slower* than real time shows the frames it produces instead of
+    /// discarding them.
+    ///
+    /// Without the second limit a 4K60 file that decodes at 40 fps is asked
+    /// for the present moment, cannot reach it, and spends its whole decode
+    /// budget on frames it throws away on the way: measured at 2 frames a
+    /// second shown against 40 decoded. It falls further behind every call, so
+    /// it never recovers. Ordinary clips never showed this because decoding
+    /// them is far faster than real time, and chasing the clock costs nothing
+    /// when you are already there.
+    ///
+    /// The cost of the second limit is that such a file plays slowly rather
+    /// than dropping frames to stay in time. For a grid of thumbnails that is
+    /// the better trade: what a tile owes the viewer is motion, not agreement
+    /// with a clock nobody can see.
     fn target(&self) -> Duration {
-        self.origin + self.started.elapsed()
+        let by_clock = self.origin + self.started.elapsed();
+        by_clock.min(self.shown + self.interval)
     }
 
     /// Restarts the clock at a position, after a seek or a loop.
@@ -240,6 +264,7 @@ impl Playing {
         self.origin = position;
         self.started = Instant::now();
         self.next_frame_due = Instant::now();
+        self.shown = position;
     }
 }
 
@@ -311,6 +336,7 @@ fn run_slot(
                         // Due immediately, so the first frame appears without
                         // waiting out an interval.
                         next_frame_due: Instant::now(),
+                        shown: Duration::ZERO,
                     }),
                     // An unplayable file just leaves its still thumbnail up.
                     Err(_) => None,
@@ -325,6 +351,7 @@ fn run_slot(
 
         match state.stream.advance_to(state.target()) {
             Ok(Advance::Frame(frame)) => {
+                state.shown = frame.timestamp;
                 let decoded = DecodedFrame {
                     tile: state.tile,
                     generation: state.generation,
@@ -362,6 +389,71 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// Builds a `Playing` whose clock is already `behind` past its origin,
+    /// which is how a decoder that cannot keep up looks from the outside.
+    fn playing_behind(behind: Duration, shown: Duration, fps: f32) -> Playing {
+        Playing {
+            stream: Box::new(FakeStream {
+                frames_left: 1,
+                restarts: Arc::new(AtomicUsize::new(0)),
+                seeks: Arc::new(Mutex::new(Vec::new())),
+                clock: Duration::ZERO,
+                die_after: None,
+            }),
+            tile: 0,
+            generation: 0,
+            origin: Duration::ZERO,
+            started: Instant::now() - behind,
+            interval: interval_for(fps),
+            next_frame_due: Instant::now(),
+            shown,
+        }
+    }
+
+    #[test]
+    fn a_stream_that_has_fallen_behind_asks_for_the_next_frame_not_the_present() {
+        // Ten seconds behind, having last shown the frame at one second. Asking
+        // for the present would mean decoding nine seconds of frames and
+        // discarding every one; asking for the next frame shows them.
+        let state = playing_behind(Duration::from_secs(10), Duration::from_secs(1), 60.0);
+        let target = state.target();
+        assert!(
+            target < Duration::from_millis(1100),
+            "should ask for just past the last frame shown, asked for {target:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_is_keeping_up_still_follows_the_clock() {
+        // Half a second in, having shown a frame moments ago: the clock is the
+        // nearer of the two, so playback stays in real time rather than
+        // running as fast as the machine can decode.
+        let state = playing_behind(Duration::from_millis(500), Duration::from_millis(490), 60.0);
+        let target = state.target();
+        assert!(
+            target >= Duration::from_millis(495) && target <= Duration::from_millis(510),
+            "should follow the clock, asked for {target:?}"
+        );
+    }
+
+    #[test]
+    fn playback_never_runs_ahead_of_the_clock() {
+        // A decoder that has raced ahead must not be allowed to keep going:
+        // the clip would play faster than it was filmed.
+        let state = playing_behind(Duration::from_millis(100), Duration::from_secs(5), 60.0);
+        assert!(state.target() <= Duration::from_millis(110), "{:?}", state.target());
+    }
+
+    #[test]
+    fn rebasing_moves_what_was_last_shown_as_well() {
+        // Otherwise a loop back to zero would leave the cap five seconds in the
+        // future and the chase would start again.
+        let mut state = playing_behind(Duration::from_secs(10), Duration::from_secs(5), 60.0);
+        state.rebase(Duration::ZERO);
+        assert_eq!(state.shown, Duration::ZERO);
+        assert!(state.target() <= state.interval + Duration::from_millis(5));
+    }
 
     /// A decoder that produces numbered 1x1 frames and ends after a few.
     struct FakeStream {
