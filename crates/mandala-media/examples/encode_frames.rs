@@ -184,8 +184,15 @@ unsafe fn write_silence(
         }
         unsafe {
             let buffer = MFCreateMemoryBuffer(bytes)?;
-            // A fresh buffer is already zeroed, and zero is silence in signed
-            // PCM, so there is nothing to fill in.
+            // Zero is silence in signed PCM, but the buffer arrives holding
+            // whatever was in that memory: Media Foundation allocates it and
+            // does not promise to clear it. An earlier version assumed it did
+            // and shipped a trailer whose "silence" peaked at two thirds of
+            // full scale -- audible noise, and nothing in the file said so.
+            let mut data: *mut u8 = std::ptr::null_mut();
+            buffer.Lock(&mut data, None, None)?;
+            std::slice::from_raw_parts_mut(data, bytes as usize).fill(0);
+            buffer.Unlock()?;
             buffer.SetCurrentLength(bytes)?;
             let sample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
