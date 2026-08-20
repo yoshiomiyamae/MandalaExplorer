@@ -173,7 +173,7 @@ mod tests {
         for count in 1..=MAX_CELLS {
             let frames: Vec<Frame> = (0..count).map(|_| solid(8, 8, RED)).collect();
             let out = mosaic(&frames, 64).unwrap();
-            let clear = out.rgba.chunks_exact(4).filter(|p| p[3] == 0).count();
+            let clear = out.rgba.as_chunks::<4>().0.iter().filter(|p| p[3] == 0).count();
             assert_eq!(clear, 0, "{count} pictures left {clear} transparent pixels");
         }
     }
