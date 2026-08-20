@@ -61,6 +61,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # build-msix.ps1 draws all 78 icon assets with Pillow rather than keeping
+      # that many PNGs in the repository. The runner has Python; it does not
+      # have Pillow, and the first tagged build found that out the hard way.
+      - name: Install Pillow, which the icon assets are drawn with
+        run: python -m pip install --quiet --disable-pip-version-check pillow
+
       # This also runs cargo build --release, so there is no separate build step.
       - name: Package
         shell: pwsh
