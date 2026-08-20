@@ -3,8 +3,7 @@
 A file browser for folders full of pictures and video.
 
 **[Install it from the Microsoft Store](https://apps.microsoft.com/detail/9P93GF7J2R94)**
-— free in Japan, ¥120 elsewhere. Or take the portable exe from
-[the latest release](https://github.com/yoshiomiyamae/MandalaExplorer/releases/latest).
+— free in Japan, ¥120 elsewhere.
 
 Ordinary explorers treat a photo the same way they treat a spreadsheet: a tiny
 icon and a filename. Mandala Explorer goes the other way. Thumbnails are as large as you
