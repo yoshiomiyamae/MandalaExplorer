@@ -121,6 +121,26 @@ extension sliding below the name it belongs to. Labels are laid out and elided
 by egui rather than trimmed by character count, since a full-width character is
 about twice the width of a Latin one.
 
+**Folders show what is inside them.** A folder icon says nothing a filename
+does not, so a folder's tile is built from the first few pictures below it: one
+fills the square, two take a side each, three put one down the left and stack
+the others, four take a corner each. Every one is cropped to its cell rather
+than squashed into it. A library sorted into dated folders has nothing but more
+folders at the top, so one level down is opened to make up a shortfall --
+lazily, and bounded, so a folder that already fills its tile reads nothing extra
+and a folder of a thousand folders is not a thousand directory reads. The tile
+is keyed on the files it was built from, so a photograph added to a folder
+changes the folder.
+
+**HEIC arrives through Windows.** The `image` crate decodes what it decodes;
+anything it refuses is handed to WIC, which is how a phone's photographs work
+here without libheif and a C toolchain arriving with them, and it brings camera
+raw and the rest of Windows' codecs along for free. This one depends on the
+machine rather than on us: the pictures inside a `.heic` are coded with HEVC, so
+it wants the HEVC Video Extension as well as the HEIF one, and that is a paid
+download. A file that cannot be decoded still appears in the grid, just without
+a preview -- hiding photographs because they might not draw would be worse.
+
 **The cache is capped.** Thumbnails live in
 `%LOCALAPPDATA%\mandala\thumbnails`, sharded by hash so no directory holds a
 hundred thousand entries, and keyed on path, size, modification time and size

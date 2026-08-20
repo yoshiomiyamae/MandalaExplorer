@@ -5,6 +5,7 @@
 //! performance, so they are kept as pure functions and pinned down by tests.
 
 pub mod cache_key;
+pub mod folder;
 pub mod kind;
 pub mod layout;
 pub mod scan;
@@ -13,6 +14,7 @@ pub mod slots;
 pub mod sort;
 
 pub use cache_key::CacheKey;
+pub use folder::{COVER_SUBFOLDERS, COVER_TILES, cover};
 pub use kind::MediaKind;
 pub use layout::{GridLayout, TileSize};
 pub use scan::{Entry, scan_dir};
