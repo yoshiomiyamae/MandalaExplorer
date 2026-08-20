@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "mandala-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "mandala-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "serde",
@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "mandala-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "image",

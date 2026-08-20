@@ -80,11 +80,10 @@ pub fn repack(src: &[u8], layout: Layout, width: u32, height: u32) -> Result<Vec
         let from = &src[src_row * stride..src_row * stride + row_bytes];
         let into = &mut out[y * row_bytes..(y + 1) * row_bytes];
         if swap_rb {
-            for (px_in, px_out) in from.chunks_exact(4).zip(into.chunks_exact_mut(4)) {
-                px_out[0] = px_in[2];
-                px_out[1] = px_in[1];
-                px_out[2] = px_in[0];
-                px_out[3] = px_in[3];
+            let (pixels_in, _) = from.as_chunks::<4>();
+            let (pixels_out, _) = into.as_chunks_mut::<4>();
+            for (px_in, px_out) in pixels_in.iter().zip(pixels_out) {
+                *px_out = [px_in[2], px_in[1], px_in[0], px_in[3]];
             }
         } else {
             into.copy_from_slice(from);

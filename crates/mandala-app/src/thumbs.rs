@@ -416,7 +416,7 @@ fn write_atomically(path: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Res
 /// Drops the alpha channel by compositing onto white, since the cache is JPEG.
 fn flatten_onto_white(frame: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity((frame.width * frame.height * 3) as usize);
-    for pixel in frame.rgba.chunks_exact(4) {
+    for pixel in frame.rgba.as_chunks::<4>().0 {
         let alpha = pixel[3] as u32;
         for &channel in &pixel[..3] {
             let value = channel as u32 * alpha + 255 * (255 - alpha);
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!((loaded.width, loaded.height), (4, 2));
         assert_eq!(loaded.rgba.len(), 4 * 2 * 4);
         assert!(
-            loaded.rgba.chunks_exact(4).all(|p| p[3] == 255),
+            loaded.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
             "reloaded alpha should be opaque"
         );
     }

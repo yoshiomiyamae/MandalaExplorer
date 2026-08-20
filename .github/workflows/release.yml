@@ -85,12 +85,15 @@ jobs:
           }
           "Both are $built"
 
-      - name: Name the assets after the version
+      # The package only. The application is sold in the Store, and a release
+      # that hands out a ready-to-run executable undercuts that -- the source
+      # is MIT and anyone may build it, but building it is not the same as
+      # clicking a download link.
+      - name: Name the asset after the version
         shell: pwsh
         run: |
           $v = '${{ steps.version.outputs.semver }}'
           Copy-Item target/msix/MandalaExplorer.msix "MandalaExplorer-$v.msix"
-          Copy-Item target/release/mandala.exe "MandalaExplorer-$v-portable.exe"
 
       # gh is already on the runner, which saves depending on a third-party
       # action for one command.
@@ -105,13 +108,13 @@ jobs:
 
           | | |
           | --- | --- |
-          | ``MandalaExplorer-$v.msix`` | The Store package. Deliberately unsigned: Partner Center signs it on submission and rejects a package that arrives signed. Not installable by double-clicking for that reason. |
-          | ``MandalaExplorer-$v-portable.exe`` | The application on its own. No installer and nothing to register -- run it and point it at a folder. |
+          | ``MandalaExplorer-$v.msix`` | The Store package, kept here so a submission can be traced back to the commit it came from. Deliberately unsigned: Partner Center signs it and rejects one that arrives signed, so it is not installable by double-clicking. |
+
+          To install the application, use [the Microsoft Store](https://apps.microsoft.com/detail/9P93GF7J2R94).
 
           Windows 10 version 2004 or later, 64-bit. Editions without Media Foundation (the N editions, unless the Media Feature Pack is installed) show still thumbnails and cannot play video.
           "@
           gh release create '${{ github.ref_name }}' `
             "MandalaExplorer-$v.msix" `
-            "MandalaExplorer-$v-portable.exe" `
             --title "Mandala Explorer $v" `
             --notes $notes

@@ -173,7 +173,7 @@ fn write_image(path: &Path, seed: u32, w: u32, h: u32) -> anyhow::Result<()> {
     paint(&mut bgra, seed as f32 * 0.6, seed, w, h);
 
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    for px in bgra.chunks_exact(4) {
+    for px in bgra.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[px[2], px[1], px[0]]);
     }
     image::RgbImage::from_raw(w, h, rgb)

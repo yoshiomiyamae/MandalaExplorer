@@ -64,11 +64,8 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Built but not kept. A release build catches what a debug one does not,
+      # and on a public repository an uploaded executable is a download link
+      # for anyone who finds the run -- which is the application being sold.
       - name: Build
         run: cargo build --release -p mandala-app
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: mandala
-          path: target/release/mandala.exe
-          if-no-files-found: error
