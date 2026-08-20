@@ -4,13 +4,20 @@
 //! implementation is Media Foundation, but keeping the seam here means an
 //! FFmpeg backend can be dropped in without the UI noticing.
 
+#[cfg(windows)]
+mod com;
+
 pub mod backend;
 pub mod frame;
+pub mod mosaic;
 pub mod sizing;
 pub mod still;
 
 #[cfg(windows)]
 pub mod mf;
+
+#[cfg(windows)]
+pub mod wic;
 
 #[cfg(windows)]
 pub use mf::MediaFoundation;

@@ -10,11 +10,18 @@ pub enum MediaKind {
     Other,
 }
 
-/// Only formats the `image` crate can actually decode are listed, so a tile
-/// never promises a thumbnail the loader cannot deliver.
+/// Formats the loader can decode: everything the `image` crate reads, plus
+/// what it hands to Windows when it cannot.
+///
+/// `heic` and `heif` are the ones that depend on the machine rather than on
+/// us. They need the HEIF Image Extension and, because the pictures inside are
+/// coded with HEVC, the HEVC Video Extension as well -- and that one is a paid
+/// download. Listing them anyway is the lesser wrong: a file browser that
+/// hides photographs because it might not be able to draw them is worse than
+/// one that shows a tile without a preview.
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "avif", "bmp", "dds", "exr", "gif", "hdr", "ico", "jpeg", "jpg", "png", "pnm", "qoi", "tga",
-    "tif", "tiff", "webp",
+    "avif", "bmp", "dds", "exr", "gif", "hdr", "heic", "heif", "ico", "jpeg", "jpg", "png", "pnm",
+    "qoi", "tga", "tif", "tiff", "webp",
 ];
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -51,8 +58,13 @@ impl MediaKind {
     }
 
     /// Whether a thumbnail can be produced for this.
+    /// Whether the grid can draw a picture for this rather than an icon.
+    ///
+    /// Directories are included because theirs is built from what is inside
+    /// them. That is not circular: a folder's tile is made of the pictures and
+    /// videos below it, never of another folder's tile.
     pub fn has_thumbnail(self) -> bool {
-        matches!(self, Self::Image | Self::Video)
+        matches!(self, Self::Image | Self::Video | Self::Directory)
     }
 }
 

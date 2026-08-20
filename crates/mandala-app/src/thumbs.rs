@@ -7,7 +7,11 @@
 use crate::cache::{CACHE_LIMIT_BYTES, mark_used, sweep};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use mandala_core::{CacheKey, Entry, MediaKind};
+use mandala_core::{
+    COVER_SUBFOLDERS, CacheKey, Entry, MediaKind, Sort, SortKey, SortOrder, cover, scan_dir,
+    sort_entries,
+};
+use mandala_media::mosaic::mosaic;
 use mandala_media::{Frame, MediaBackend};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -39,6 +43,12 @@ pub enum Job {
         meta_key: CacheKey,
         tier: u32,
     },
+    /// A mosaic of what is inside a folder.
+    ///
+    /// It carries no cache key, unlike the others: which files the tile is
+    /// built from is only known after reading the directory, and that read is
+    /// I/O that belongs on a worker rather than on the UI thread.
+    Folder { path: PathBuf, tier: u32 },
     /// Only the running time, for a video that is not on screen.
     ///
     /// Sorting by length has to know about files nobody has looked at yet, and
@@ -54,6 +64,9 @@ impl Job {
     /// under the name of an M-pixel one, and poison that file's cache entry
     /// with no error and nothing to notice short of looking at the pixels.
     pub fn thumbnail(entry: &Entry, tier: u32) -> Self {
+        if entry.is_dir() {
+            return Job::Folder { path: entry.path.clone(), tier };
+        }
         Job::Thumbnail {
             path: entry.path.clone(),
             kind: entry.kind,
@@ -231,7 +244,81 @@ fn run(job: &Job, cache_dir: &Path, backend: &impl MediaBackend) -> JobDone {
                 produce(path, *kind, key, meta_key, *tier, cache_dir, backend);
             JobDone { path: path.clone(), thumbnail: Some(thumbnail), duration }
         }
+        Job::Folder { path, tier } => JobDone {
+            path: path.clone(),
+            thumbnail: Some(produce_folder(path, *tier, cache_dir, backend)),
+            duration: None,
+        },
     }
+}
+
+/// Builds a folder's tile out of the first few pictures inside it.
+///
+/// Reading directories happens here rather than on the UI thread, and only for
+/// folders actually on screen: a listing of ten thousand folders would
+/// otherwise be ten thousand directory reads before the first tile appeared.
+fn produce_folder(
+    dir: &Path,
+    tier: u32,
+    cache_dir: &Path,
+    backend: &impl MediaBackend,
+) -> Result<Frame> {
+    let by_name = Sort { key: SortKey::Name, order: SortOrder::Ascending };
+    let listing = |path: &Path| {
+        let mut entries = scan_dir(path).unwrap_or_default();
+        // Always by name, whatever the window is sorted by. Sorting these the
+        // way the grid happens to be sorted would change every folder's tile,
+        // and so every folder's cache key, each time that setting moved.
+        sort_entries(&mut entries, by_name, |_| None);
+        entries
+    };
+
+    let direct = listing(dir);
+    let subfolders: Vec<PathBuf> = direct
+        .iter()
+        .filter(|e| e.is_dir())
+        .take(COVER_SUBFOLDERS)
+        .map(|e| e.path.clone())
+        .collect();
+    // Lazily, so a folder whose own pictures fill the tile reads nothing more.
+    let picks = cover(&direct, subfolders.iter().map(|p| listing(p)));
+    if picks.is_empty() {
+        return Err(anyhow!("{} has no pictures to show", dir.display()));
+    }
+
+    let key = CacheKey::for_group(dir, &picks, tier);
+    let cached = cache_dir.join(key.relative_path("jpg"));
+    if let Ok(frame) = load_cached(&cached) {
+        return Ok(frame);
+    }
+
+    // Cells are half the tile across, so the parts need half the pixels. Asking
+    // for a real tier rather than exactly half means these are the same files
+    // the folder's own contents will use once someone opens it.
+    let part_tier = thumbnail_tier(tier / 2);
+    let mut frames = Vec::new();
+    for pick in &picks {
+        let (frame, _) = produce(
+            &pick.path,
+            pick.kind,
+            &CacheKey::for_entry(pick, part_tier),
+            &CacheKey::metadata_for(pick),
+            part_tier,
+            cache_dir,
+            backend,
+        );
+        // One unreadable picture should cost its cell, not the whole tile.
+        if let Ok(frame) = frame {
+            frames.push(frame);
+        }
+    }
+    if frames.is_empty() {
+        return Err(anyhow!("nothing inside {} could be decoded", dir.display()));
+    }
+
+    let tile = mosaic(&frames, tier)?;
+    let _ = store_cached(&cached, &tile);
+    Ok(tile)
 }
 
 /// Loads a thumbnail from the disk cache, or makes one and caches it.

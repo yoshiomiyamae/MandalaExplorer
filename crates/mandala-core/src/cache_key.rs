@@ -46,6 +46,28 @@ impl CacheKey {
         Self::new(&entry.path, entry.mtime_unix_nanos(), entry.len, target_px)
     }
 
+    /// Key for a tile assembled from several files, such as a folder's mosaic.
+    ///
+    /// The parts are part of the identity, in order: a folder whose first four
+    /// pictures changed, or merely got reordered by a rename, is a different
+    /// tile and must not be served the old one. The folder's own path is in
+    /// there too, so two folders that happen to show the same four pictures
+    /// still get a cache entry each rather than fighting over one.
+    pub fn for_group(path: &Path, parts: &[Entry], target_px: u32) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"group");
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        for part in parts {
+            hasher.update(part.path.to_string_lossy().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(&part.mtime_unix_nanos().to_le_bytes());
+            hasher.update(&part.len.to_le_bytes());
+        }
+        hasher.update(&target_px.to_le_bytes());
+        Self(hasher.finalize().to_hex()[..KEY_BYTES * 2].to_owned())
+    }
+
     /// Size-independent key for a scanned entry.
     pub fn metadata_for(entry: &Entry) -> Self {
         Self::metadata(&entry.path, entry.mtime_unix_nanos(), entry.len)
@@ -68,6 +90,64 @@ mod tests {
 
     fn key(path: &str, mtime: i128, len: u64, px: u32) -> CacheKey {
         CacheKey::new(Path::new(path), mtime, len, px)
+    }
+
+    fn part(name: &str, len: u64) -> Entry {
+        Entry {
+            path: std::path::PathBuf::from(name),
+            name: name.to_owned(),
+            kind: crate::MediaKind::Image,
+            len,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn a_group_key_is_deterministic() {
+        let parts = [part("a.jpg", 1), part("b.jpg", 2)];
+        let dir = Path::new("photos");
+        assert_eq!(CacheKey::for_group(dir, &parts, 256), CacheKey::for_group(dir, &parts, 256));
+    }
+
+    #[test]
+    fn a_group_key_changes_when_one_of_its_parts_does() {
+        let dir = Path::new("photos");
+        let before = [part("a.jpg", 1), part("b.jpg", 2)];
+        let after = [part("a.jpg", 1), part("b.jpg", 99)];
+        assert_ne!(CacheKey::for_group(dir, &before, 256), CacheKey::for_group(dir, &after, 256));
+    }
+
+    #[test]
+    fn a_group_key_changes_when_its_parts_are_reordered() {
+        // The order is what the tile looks like, so it is part of the identity.
+        let dir = Path::new("photos");
+        let one = [part("a.jpg", 1), part("b.jpg", 2)];
+        let other = [part("b.jpg", 2), part("a.jpg", 1)];
+        assert_ne!(CacheKey::for_group(dir, &one, 256), CacheKey::for_group(dir, &other, 256));
+    }
+
+    #[test]
+    fn a_group_key_changes_with_the_size_and_with_the_folder() {
+        let parts = [part("a.jpg", 1)];
+        assert_ne!(
+            CacheKey::for_group(Path::new("photos"), &parts, 256),
+            CacheKey::for_group(Path::new("photos"), &parts, 512)
+        );
+        assert_ne!(
+            CacheKey::for_group(Path::new("photos"), &parts, 256),
+            CacheKey::for_group(Path::new("videos"), &parts, 256)
+        );
+    }
+
+    #[test]
+    fn a_group_key_is_not_the_key_of_its_only_part() {
+        // A folder showing one picture must not be handed that picture's own
+        // cached thumbnail, which is the whole picture rather than a tile.
+        let only = part("a.jpg", 1);
+        assert_ne!(
+            CacheKey::for_group(Path::new("a.jpg"), std::slice::from_ref(&only), 256),
+            CacheKey::for_entry(&only, 256)
+        );
     }
 
     #[test]

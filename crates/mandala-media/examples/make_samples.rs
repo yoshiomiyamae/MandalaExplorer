@@ -1,6 +1,10 @@
 //! Generates a folder of sample images and videos to browse.
 //!
-//! Useful for exercising the grid without pointing it at personal files.
+//! Useful for exercising the grid without pointing it at personal files. What
+//! it writes is chosen to reach the awkward cases rather than the pretty ones:
+//! subfolders holding one, two, three and four pictures so every mosaic layout
+//! appears, a folder holding nothing, a folder holding only more folders, and
+//! a HEIC where Windows has the codec for one.
 //!
 //! ```
 //! cargo run -p mandala-media --example make_samples -- C:\some\folder 40
@@ -39,7 +43,100 @@ fn main() -> anyhow::Result<()> {
             write_image(&path, i)?;
         }
     }
+    write_folders(&dir)?;
+
+    // Only where Windows has the codec, which is not everywhere: a .heic that
+    // cannot be decoded is itself worth looking at, but it is not what this is
+    // for.
+    let heic = dir.join("from-a-phone.heic");
+    match write_heic(&heic, 7) {
+        Ok(()) => println!("wrote {}", heic.display()),
+        Err(e) => println!("no HEIC written: {e}"),
+    }
+
     println!("done");
+    Ok(())
+}
+
+/// Writes the subfolders a folder tile is worth testing against.
+fn write_folders(dir: &Path) -> anyhow::Result<()> {
+    // One of each count the mosaic arranges differently, and one past it.
+    for (name, items) in [("one", 1u32), ("two", 2), ("three", 3), ("four", 4), ("many", 9)] {
+        let sub = dir.join(format!("folder-{name}"));
+        std::fs::create_dir_all(&sub)?;
+        for i in 0..items {
+            write_image(&sub.join(format!("{name}-{i}.png")), 100 + i)?;
+        }
+    }
+
+    // Nothing to build a tile from, which has to fall back rather than fail.
+    std::fs::create_dir_all(dir.join("folder-empty"))?;
+
+    // The shape a photo library actually takes: a year of dated folders, with
+    // no pictures at the level you are looking at.
+    for month in 1..=3u32 {
+        let inner = dir.join("folder-by-date").join(format!("2026-{month:02}"));
+        std::fs::create_dir_all(&inner)?;
+        for i in 0..2u32 {
+            write_image(&inner.join(format!("{month:02}-{i}.png")), 200 + month * 10 + i)?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes a HEIC through WIC, which only works where the codec is installed.
+fn write_heic(path: &Path, seed: u32) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+
+    const W: u32 = 960;
+    const H: u32 = 720;
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory2, None, CLSCTX_INPROC_SERVER)
+                .context("no WIC factory")?;
+
+        let encoder = factory
+            .CreateEncoder(&GUID_ContainerFormatHeif, std::ptr::null())
+            .context("no HEIF encoder on this machine")?;
+
+        let stream = factory.CreateStream()?;
+        stream.InitializeFromFilename(
+            &HSTRING::from(path.as_os_str()),
+            windows::Win32::Foundation::GENERIC_WRITE.0,
+        )?;
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+
+        let mut frame = None;
+        encoder.CreateNewFrame(&mut frame, std::ptr::null_mut())?;
+        let frame = frame.context("the encoder made no frame")?;
+        frame.Initialize(None)?;
+        frame.SetSize(W, H)?;
+        let mut format = GUID_WICPixelFormat32bppBGRA;
+        frame.SetPixelFormat(&mut format)?;
+
+        // Something recognisable rather than a flat colour, so a decode that
+        // half works is visibly different from one that works.
+        let mut pixels = vec![0u8; (W * H * 4) as usize];
+        for y in 0..H {
+            for x in 0..W {
+                let i = ((y * W + x) * 4) as usize;
+                let u = x as f32 / W as f32;
+                let v = y as f32 / H as f32;
+                let ring = ((u - 0.5).hypot(v - 0.5) * 14.0 + seed as f32).sin() * 0.5 + 0.5;
+                pixels[i] = (255.0 * ring * u) as u8;
+                pixels[i + 1] = (255.0 * (1.0 - ring)) as u8;
+                pixels[i + 2] = (255.0 * ring * v) as u8;
+                pixels[i + 3] = 255;
+            }
+        }
+        frame.WritePixels(H, W * 4, &pixels)?;
+        frame.Commit()?;
+        encoder.Commit()?;
+    }
     Ok(())
 }
 

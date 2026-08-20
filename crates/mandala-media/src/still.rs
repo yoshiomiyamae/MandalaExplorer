@@ -19,8 +19,26 @@ pub fn load(path: &Path) -> Result<Frame> {
 }
 
 /// Decodes an image file and scales it down to fit `max`.
+///
+/// Whatever the `image` crate cannot read is handed to Windows, which is how
+/// HEIC works here without libheif and a C toolchain coming along with it.
+/// Trying and failing first, rather than routing on the extension, means every
+/// other format Windows happens to know -- camera raw, JPEG XR -- arrives for
+/// free instead of needing a list kept in step with two decoders.
 pub fn load_thumbnail(path: &Path, max: (u32, u32)) -> Result<Frame> {
-    let image = decode(path)?;
+    let image = match decode(path) {
+        Ok(image) => image,
+        #[cfg(windows)]
+        Err(rust_side) => {
+            return crate::wic::load_thumbnail(path, max).map_err(|windows_side| {
+                // Both are worth keeping: which one matters depends on whether
+                // the file is broken or merely of a format we do not know.
+                rust_side.context(format!("Windows could not read it either: {windows_side}"))
+            });
+        }
+        #[cfg(not(windows))]
+        Err(e) => return Err(e),
+    };
 
     let (w, h) = fit_within((image.width(), image.height()), max);
     // Triangle rather than Lanczos: at thumbnail sizes the difference is barely

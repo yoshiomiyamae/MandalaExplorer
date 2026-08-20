@@ -9,6 +9,7 @@
 pub mod d3d;
 
 use crate::backend::{Advance, MediaBackend, VideoStream, VideoThumbnail, thumbnail_timestamp};
+use crate::com::ensure_thread_com;
 use crate::frame::{Frame, Layout};
 use crate::sizing::fit_within;
 use anyhow::{Context, Result, anyhow};
@@ -20,7 +21,6 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0, PropVariantClear,
 };
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Variant::{VT_I8, VT_UI8};
 use windows::core::{GUID, HSTRING, Interface};
 
@@ -61,36 +61,6 @@ fn ensure_startup() -> Result<()> {
         .as_ref()
         .map(|_| ())
         .map_err(|e| anyhow!("MFStartup failed: {e}"))
-}
-
-/// Puts the calling thread into the multithreaded apartment.
-///
-/// Every thread that touches a Source Reader needs this, and decoding happens
-/// on worker threads, so it is done per thread and torn down with the thread.
-fn ensure_thread_com() {
-    thread_local! {
-        static COM_GUARD: ComGuard = ComGuard::new();
-    }
-    COM_GUARD.with(|_| {});
-}
-
-struct ComGuard;
-
-impl ComGuard {
-    fn new() -> Self {
-        unsafe {
-            // Already initialized on this thread is fine; the UI framework may
-            // well have gotten there first.
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        }
-        Self
-    }
-}
-
-impl Drop for ComGuard {
-    fn drop(&mut self) {
-        unsafe { CoUninitialize() };
-    }
 }
 
 /// Decoding backed by Windows Media Foundation.
