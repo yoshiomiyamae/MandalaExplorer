@@ -1,0 +1,111 @@
+name: Release
+
+# Tagging is the whole trigger: `git tag v0.2.0 && git push --tags` produces a
+# release carrying the MSIX to upload to Partner Center. Submitting it is still
+# manual, because the Store's automated update path -- the msstore CLI and the
+# action that wraps it -- is documented as supporting free products only, and
+# this one is priced per market.
+on:
+  push:
+    tags: ['v*']
+
+# Creating a release writes to the repository. Nothing else here does.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  package:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Read the version out of the tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
+            throw "Tag '$tag' is not vMAJOR.MINOR.PATCH"
+          }
+          $semver = $tag.Substring(1)
+          # The manifest takes four parts and the Store insists the fourth is 0.
+          "semver=$semver" >> $env:GITHUB_OUTPUT
+          "package=$semver.0" >> $env:GITHUB_OUTPUT
+
+      - name: The tag and Cargo.toml must agree
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1
+          if (-not $line) { throw 'Cargo.toml has no version line' }
+          $cargo = $line.Matches[0].Groups[1].Value
+          $tag = '${{ steps.version.outputs.semver }}'
+          if ($cargo -ne $tag) {
+            throw "Tag says $tag but Cargo.toml says $cargo. Bump one of them."
+          }
+          "Both say $tag"
+
+      # A release is the one build people install, so it is tested here rather
+      # than trusted to have passed on main. Public repositories run standard
+      # runners for free, so this costs waiting and nothing else.
+      - name: Test
+        run: cargo test --workspace
+
+      # This also runs cargo build --release, so there is no separate build step.
+      - name: Package
+        shell: pwsh
+        run: .\packaging\build-msix.ps1 -Version ${{ steps.version.outputs.package }}
+
+      # The package has been stale before: an MSIX went to Partner Center
+      # holding a binary five commits behind, and nothing said so. Comparing
+      # the packaged executable against the one just built makes that loud.
+      - name: The package must hold the binary just built
+        shell: pwsh
+        run: |
+          $built = (Get-FileHash target/release/mandala.exe -Algorithm SHA256).Hash
+          $packed = (Get-FileHash target/msix/layout/mandala.exe -Algorithm SHA256).Hash
+          if ($built -ne $packed) {
+            throw "Packaged $packed but built $built"
+          }
+          "Both are $built"
+
+      - name: Name the assets after the version
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.semver }}'
+          Copy-Item target/msix/MandalaExplorer.msix "MandalaExplorer-$v.msix"
+          Copy-Item target/release/mandala.exe "MandalaExplorer-$v-portable.exe"
+
+      # gh is already on the runner, which saves depending on a third-party
+      # action for one command.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $v = '${{ steps.version.outputs.semver }}'
+          $notes = @"
+          ## Files
+
+          | | |
+          | --- | --- |
+          | ``MandalaExplorer-$v.msix`` | The Store package. Deliberately unsigned: Partner Center signs it on submission and rejects a package that arrives signed. Not installable by double-clicking for that reason. |
+          | ``MandalaExplorer-$v-portable.exe`` | The application on its own. No installer and nothing to register -- run it and point it at a folder. |
+
+          Windows 10 version 2004 or later, 64-bit. Editions without Media Foundation (the N editions, unless the Media Feature Pack is installed) show still thumbnails and cannot play video.
+          "@
+          gh release create '${{ github.ref_name }}' `
+            "MandalaExplorer-$v.msix" `
+            "MandalaExplorer-$v-portable.exe" `
+            --title "Mandala Explorer $v" `
+            --notes $notes
