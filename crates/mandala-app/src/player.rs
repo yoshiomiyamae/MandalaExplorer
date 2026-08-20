@@ -595,6 +595,115 @@ mod tests {
         false
     }
 
+    /// A decoder that honours the target, unlike `FakeStream`, so the pacing
+    /// policy is what is under test rather than the fake's own clock.
+    struct PacedStream {
+        spacing: Duration,
+        clock: Duration,
+    }
+
+    impl VideoStream for PacedStream {
+        fn advance_to(&mut self, target: Duration) -> Result<Advance> {
+            if self.clock >= target && self.clock > Duration::ZERO {
+                return Ok(Advance::Unchanged);
+            }
+            // The first frame at or past the target, which is what a real
+            // decoder reading forward would hand back.
+            while self.clock < target {
+                self.clock += self.spacing;
+            }
+            if self.clock == Duration::ZERO {
+                self.clock = self.spacing;
+            }
+            Ok(Advance::Frame(Frame {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+                timestamp: self.clock,
+            }))
+        }
+
+        fn duration(&self) -> Option<Duration> {
+            Some(Duration::from_secs(60))
+        }
+
+        fn restart(&mut self) -> Result<()> {
+            self.clock = Duration::ZERO;
+            Ok(())
+        }
+
+        fn seek(&mut self, position: Duration) -> Result<()> {
+            self.clock = position;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct PacedBackend {
+        spacing: Duration,
+    }
+
+    impl MediaBackend for PacedBackend {
+        fn open_video(&self, _path: &Path, _max: (u32, u32)) -> Result<Box<dyn VideoStream>> {
+            Ok(Box::new(PacedStream { spacing: self.spacing, clock: Duration::ZERO }))
+        }
+
+        fn video_thumbnail(
+            &self,
+            _path: &Path,
+            _max: (u32, u32),
+        ) -> Result<mandala_media::VideoThumbnail> {
+            anyhow::bail!("not needed")
+        }
+
+        fn probe_duration(&self, _path: &Path) -> Result<Option<Duration>> {
+            Ok(None)
+        }
+    }
+
+    /// How far into a clip playback has reached after roughly `wall` of real
+    /// time, for a source whose frames are `spacing` apart.
+    fn reached_after(spacing: Duration, wall: Duration) -> (Duration, Duration) {
+        let mut service = PlaybackService::new(PacedBackend { spacing }, || {});
+        service.resize(1);
+        let started = Instant::now();
+        service.apply(&SlotPlan { stop: vec![], start: vec![(0, 0)] }, 1, None, source);
+
+        let mut furthest = Duration::ZERO;
+        while started.elapsed() < wall {
+            for frame in frames(&mut service) {
+                furthest = furthest.max(frame.frame.timestamp);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for frame in frames(&mut service) {
+            furthest = furthest.max(frame.frame.timestamp);
+        }
+        (furthest, started.elapsed())
+    }
+
+    #[test]
+    fn playback_does_not_run_ahead_of_real_time() {
+        // A clip cannot be shown faster than it was filmed, whatever the tile
+        // rate is: half a second of watching is at most half a second of clip,
+        // give or take the frame straddling the end.
+        for spacing in [Duration::from_millis(16), Duration::from_millis(200)] {
+            let (reached, wall) = reached_after(spacing, Duration::from_millis(500));
+            assert!(
+                reached <= wall + spacing,
+                "frames {spacing:?} apart: reached {reached:?} of clip in {wall:?} of real time"
+            );
+        }
+    }
+
+    #[test]
+    fn playback_does_actually_advance() {
+        // The other half of the same guard: a cap that never lets go would
+        // satisfy the test above by showing nothing at all.
+        let (reached, _) = reached_after(Duration::from_millis(16), Duration::from_millis(500));
+        assert!(reached >= Duration::from_millis(200), "only reached {reached:?}");
+    }
+
     #[test]
     fn resizing_creates_and_removes_slots() {
         let (mut service, _, _) = service();
