@@ -20,6 +20,25 @@ Those three commands are exactly what CI runs, in that order, so running them
 first turns a twenty-minute round trip into a local one. `main` also refuses
 force pushes and deletion, and that rule has no exception for anyone.
 
+## Cutting a release
+
+Bump `version` in the workspace `Cargo.toml`, land that through a pull request,
+then tag it:
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The tag builds the release, runs the tests, packages the MSIX, checks that the
+packaged executable is byte-for-byte the one just built, and publishes a GitHub
+release carrying the MSIX and a portable exe. The workflow refuses a tag that
+disagrees with `Cargo.toml`, so the two cannot drift.
+
+Submitting to the Store is still done by hand in Partner Center. The automated
+route -- the msstore CLI and the action wrapping it -- is documented as
+supporting free products only, and this one is priced per market.
+
 ## What the tests are for
 
 Anything with a decision in it gets a test: grid geometry, the playback
