@@ -108,7 +108,7 @@ fn audio_peak(path: &Path) -> anyhow::Result<Option<i32>> {
             let mut length = 0u32;
             buffer.Lock(&mut data, None, Some(&mut length))?;
             let bytes = std::slice::from_raw_parts(data, length as usize);
-            for pair in bytes.chunks_exact(2) {
+            for pair in bytes.as_chunks::<2>().0 {
                 let value = i16::from_le_bytes([pair[0], pair[1]]) as i32;
                 peak = peak.max(value.abs());
             }
