@@ -32,8 +32,15 @@ git push origin v0.2.0
 
 The tag builds the release, runs the tests, packages the MSIX, checks that the
 packaged executable is byte-for-byte the one just built, and publishes a GitHub
-release carrying the MSIX and a portable exe. The workflow refuses a tag that
-disagrees with `Cargo.toml`, so the two cannot drift.
+release carrying that MSIX. The workflow refuses a tag that disagrees with
+`Cargo.toml`, so the two cannot drift.
+
+The release carries nothing anyone can run. The application is sold in the
+Store, and a download link undercuts that; the source is MIT and anyone may
+build it, which is not the same thing. The MSIX is there so a submission can be
+traced back to the commit it came from, and being unsigned it cannot be
+installed by double-clicking anyway. CI does not keep its build either, for the
+same reason.
 
 Submitting to the Store is still done by hand in Partner Center. The automated
 route -- the msstore CLI and the action wrapping it -- is documented as
