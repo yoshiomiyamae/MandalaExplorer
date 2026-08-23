@@ -120,6 +120,7 @@ pub enum Phrase {
     BookmarkAdd,
     BookmarkRemove,
     BookmarksEmpty,
+    Reload,
 }
 
 impl Language {
@@ -145,6 +146,7 @@ impl Language {
             (English, BookmarkAdd) => "Keep this folder",
             (English, BookmarkRemove) => "Stop keeping this folder",
             (English, BookmarksEmpty) => "No folders kept yet",
+            (English, Reload) => "Read this folder again (F5)",
 
             (Japanese, Size) => "サイズ",
             (Japanese, Autoplay) => "自動再生",
@@ -164,6 +166,7 @@ impl Language {
             (Japanese, BookmarkAdd) => "このフォルダーを登録",
             (Japanese, BookmarkRemove) => "このフォルダーの登録を解除",
             (Japanese, BookmarksEmpty) => "登録されたフォルダーはありません",
+            (Japanese, Reload) => "このフォルダーを読み直す (F5)",
         }
     }
 
@@ -215,7 +218,7 @@ mod tests {
     use super::*;
 
     const ALL: [Language; 2] = [Language::English, Language::Japanese];
-    const PHRASES: [Phrase; 18] = [
+    const PHRASES: [Phrase; 19] = [
         Phrase::Size,
         Phrase::Autoplay,
         Phrase::AtOnce,
@@ -234,6 +237,7 @@ mod tests {
         Phrase::BookmarkAdd,
         Phrase::BookmarkRemove,
         Phrase::BookmarksEmpty,
+        Phrase::Reload,
     ];
 
     #[test]
