@@ -281,6 +281,51 @@ impl MandalaApp {
         }
     }
 
+    /// Reads the current folder again.
+    ///
+    /// Not `navigate_to(current_dir)`, which would be the obvious thing and the
+    /// wrong one: that clears the filter and throws away every thumbnail. What
+    /// someone reloading wants is the same view of a folder that has changed
+    /// underneath them, not a fresh start.
+    ///
+    /// Textures are kept and merely asked for again. The disk cache is keyed on
+    /// path, size and modification time, so a file that did not change comes
+    /// back identical -- nothing flickers -- and one that did comes back
+    /// different a moment later. Dropping them first would blank the grid to
+    /// arrive at the same place.
+    ///
+    /// Files that are gone lose their tiles, and their textures with them: the
+    /// position map is rebuilt from what is still there, and eviction goes by
+    /// that map.
+    fn reload(&mut self) {
+        let here = self.current_dir.clone();
+        match scan_dir(&here) {
+            Ok(entries) => {
+                self.scanned = entries;
+                self.error = None;
+                // Asked for again rather than assumed unchanged. A file whose
+                // contents moved on keeps its path, and its record here is all
+                // that would stop anyone noticing.
+                self.requested_thumbs.clear();
+                self.requested_durations.clear();
+                self.durations.clear();
+                self.resort();
+            }
+            Err(e) => {
+                // The folder went while it was open: a drive unplugged, a share
+                // dropped. Say so rather than showing its contents as if they
+                // were still there.
+                self.error = Some(format!("{}: {e}", here.display()));
+                self.scanned.clear();
+                self.entries.clear();
+                self.path_to_tile.clear();
+                self.unprobed.clear();
+                self.summary.clear();
+                self.stop_playback();
+            }
+        }
+    }
+
     /// Tears down everything tied to a playback slot.
     ///
     /// Slots are bound to positions, so every caller that moves positions has
@@ -578,6 +623,10 @@ impl MandalaApp {
                     self.navigate_to(parent);
                 }
 
+                if ui.button("\u{21bb}").on_hover_text(self.lang.text(Phrase::Reload)).clicked() {
+                    self.reload();
+                }
+
                 // Before the path field, not after: that field is told to take
                 // every pixel left on the row, so anything following it is laid
                 // out with none and never appears at all.
@@ -800,6 +849,12 @@ impl eframe::App for MandalaApp {
             && let Some(parent) = self.parent_dir()
         {
             self.navigate_to(parent);
+        }
+
+        // F5 because that is what every file browser and every browser uses,
+        // and nobody should have to find the button.
+        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+            self.reload();
         }
 
         let mut activated = None;

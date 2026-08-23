@@ -33,6 +33,7 @@ release build has no console, and runs the app code optimised rather than at
 | --- | --- |
 | Open a folder or file | double click |
 | Go up | the arrow button, or Backspace |
+| Read the folder again | the circular arrow, or F5 |
 | Jump to a path | type it in the path box, Enter |
 | Thumbnail size | the size slider, or Ctrl and the wheel |
 | Scrub a video | point at its tile, drag the strip along the bottom |
@@ -49,6 +50,12 @@ geometry. The filter is not: an application that starts up hiding most of a
 folder, for a reason written down in a settings file, is one nobody can work
 out from the outside. It clears when you open another folder, for the same
 reason.
+
+Reloading keeps the filter and the scroll position, and does not throw the
+thumbnails away: the disk cache is keyed on size and modification time, so a
+file that did not change comes back identical and one that did comes back
+different a moment later. Blanking the grid first would arrive at the same
+place, slower and with a flash.
 
 Filtering takes several words, and every one of them has to appear somewhere in
 the name, in any order -- `beach 2026` finds `2026-08-beach-trip.jpg`. Case is
