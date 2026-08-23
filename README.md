@@ -39,9 +39,23 @@ release build has no console, and runs the app code optimised rather than at
 | Reorder | pick a key next to Sort, click the arrow to reverse |
 | How many videos play at once | the "at once" slider |
 | Play only what you point at | untick Autoplay |
+| Narrow to some of the names | type in the filter box |
+| Keep a folder to come back to | the star, next to the path |
+| Go back to one | the Bookmarks button |
 
-Plain wheel scrolls, so resizing needs Ctrl held. Tile size, playback count and
-sort order are remembered between runs, along with the window geometry.
+Plain wheel scrolls, so resizing needs Ctrl held. Tile size, playback count,
+sort order and kept folders are remembered between runs, along with the window
+geometry. The filter is not: an application that starts up hiding most of a
+folder, for a reason written down in a settings file, is one nobody can work
+out from the outside. It clears when you open another folder, for the same
+reason.
+
+Filtering takes several words, and every one of them has to appear somewhere in
+the name, in any order -- `beach 2026` finds `2026-08-beach-trip.jpg`. Case is
+ignored, and the extension is part of the name, so `mp4` is also how you see
+only the video. The count on the right says how many of the folder you are
+looking at, because a bare number while a filter is on reads as the rest having
+gone missing.
 
 Sorting works on name, type, size, modification time, or running length, each
 either way round. Folders stay at the top whichever key and direction is
