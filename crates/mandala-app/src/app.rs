@@ -80,6 +80,12 @@ pub struct Settings {
     /// Folders worth coming back to, oldest first.
     #[serde(default)]
     pub bookmarks: Vec<PathBuf>,
+    /// Whether the tile under the pointer is audible.
+    ///
+    /// Off unless asked for. A grid that starts making noise because the
+    /// pointer crossed it is not one anyone would leave open.
+    #[serde(default)]
+    pub sound: bool,
 }
 
 impl Settings {
@@ -109,6 +115,7 @@ impl Default for Settings {
             show_labels: true,
             sort: Sort::default(),
             bookmarks: Vec::new(),
+            sound: false,
         }
     }
 }
@@ -137,6 +144,7 @@ pub struct MandalaApp {
     settings: Settings,
     thumbs: ThumbnailService,
     player: PlaybackService,
+    sound: crate::sound::SoundService,
 
     /// Still thumbnail per file. Keyed by path rather than by position, so
     /// re-sorting the folder does not throw away everything already loaded.
@@ -236,6 +244,7 @@ impl MandalaApp {
             current_tier: 0,
             applied_sort,
             needs_resort: false,
+            sound: crate::sound::SoundService::new(),
             playback: HashMap::new(),
             lang,
             hovered: None,
@@ -690,6 +699,9 @@ impl MandalaApp {
                     self.settings.sort.order = self.settings.sort.order.flipped();
                 }
 
+                ui.checkbox(&mut self.settings.sound, self.lang.text(Phrase::Sound))
+                    .on_hover_text(self.lang.text(Phrase::SoundTip));
+
                 ui.separator();
                 ui.checkbox(&mut self.settings.show_labels, self.lang.text(Phrase::Names));
 
@@ -715,6 +727,28 @@ impl MandalaApp {
                 });
             });
         });
+    }
+
+    /// Points the sound at whatever the pointer is over.
+    ///
+    /// Only a video that is actually playing: a still has no sound, and a
+    /// video whose tile is not playing is not one anyone is watching. Called
+    /// every frame, and cheap when the answer has not changed.
+    fn follow_sound(&mut self) {
+        let playing = self
+            .hovered
+            .filter(|_| self.settings.sound)
+            .and_then(|tile| Some((tile, *self.playback.get(&tile)?)))
+            .filter(|(tile, _)| {
+                self.entries.get(*tile).is_some_and(|e| e.kind == MediaKind::Video)
+            });
+        // The picture's position travels with the file, since it is what the
+        // sound has to be moved to -- both when it starts and whenever the two
+        // have come apart.
+        match playing.and_then(|(tile, info)| Some((self.entries.get(tile)?, info))) {
+            Some((entry, info)) => self.sound.follow(Some(&entry.path), info.position),
+            None => self.sound.follow(None, Duration::ZERO),
+        }
     }
 
     /// Draws the bookmarks menu and reports the folder chosen from it.
@@ -927,6 +961,7 @@ impl eframe::App for MandalaApp {
                     let center = viewport.min.y + viewport.height() / 2.0;
                     let settled = self.settle.update(viewport.min.y, Instant::now());
                     self.hovered = hovered_now;
+                    self.follow_sound();
                     self.retier_thumbnails();
                     self.request_visible_thumbnails();
                     self.request_missing_durations();
@@ -1300,6 +1335,7 @@ mod tests {
         let older = "(tile_px:300.0,autoplay:true,budget:8,show_labels:true,                     sort:(key:Name,order:Ascending))";
         let decoded: Settings = ron::from_str(older).expect("an older file must still parse");
         assert!(decoded.bookmarks.is_empty());
+        assert!(!decoded.sound, "and sound stays off until it is asked for");
         assert_eq!(decoded.budget, 8);
     }
 
@@ -1312,6 +1348,7 @@ mod tests {
             show_labels: false,
             sort: Sort { key: SortKey::Size, order: SortOrder::Descending },
             bookmarks: vec![PathBuf::from("photos"), PathBuf::from("clips")],
+            sound: true,
         };
         let encoded = ron::to_string(&settings).unwrap();
         let decoded: Settings = ron::from_str(&encoded).unwrap();
@@ -1320,6 +1357,7 @@ mod tests {
         assert!(!decoded.autoplay);
         assert!(!decoded.show_labels);
         assert_eq!(decoded.bookmarks.len(), 2, "bookmarks have to survive a restart");
+        assert!(decoded.sound, "and so does whether sound was wanted");
         assert_eq!(decoded.sort.key, SortKey::Size);
         assert_eq!(decoded.sort.order, SortOrder::Descending);
     }
