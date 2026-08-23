@@ -845,7 +845,12 @@ impl eframe::App for MandalaApp {
 
         self.top_bar(ui);
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Backspace))
+        // Backspace belongs to whatever text field has focus. Taken globally
+        // it did both: the field deleted a character and the folder changed,
+        // and changing folder rewrites the path box with the new path -- so
+        // one press looked like several characters vanishing at once.
+        if !ctx.text_edit_focused()
+            && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
             && let Some(parent) = self.parent_dir()
         {
             self.navigate_to(parent);
