@@ -9,6 +9,7 @@ mod cache;
 mod fonts;
 mod lang;
 mod player;
+mod sound;
 mod thumbs;
 
 use crate::lang::Language;

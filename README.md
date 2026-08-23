@@ -40,6 +40,7 @@ release build has no console, and runs the app code optimised rather than at
 | Reorder | pick a key next to Sort, click the arrow to reverse |
 | How many videos play at once | the "at once" slider |
 | Play only what you point at | untick Autoplay |
+| Hear the tile you point at | tick Sound |
 | Narrow to some of the names | type in the filter box |
 | Keep a folder to come back to | the star, next to the path |
 | Go back to one | the Bookmarks button |
@@ -179,6 +180,25 @@ machine rather than on us: the pictures inside a `.heic` are coded with HEVC, so
 it wants the HEVC Video Extension as well as the HEIF one, and that is a paid
 download. A file that cannot be decoded still appears in the grid, just without
 a preview -- hiding photographs because they might not draw would be worse.
+
+**Sound follows the picture, and only one tile of it.** A grid where every
+playing tile is also audible is not a feature anyone wants twice, so the one
+under the pointer is the one you hear, and only if Sound is ticked -- a browser
+that starts making noise because the pointer crossed it would not stay open.
+
+The picture leads. A tile is already partway through its clip by the time
+anyone points at it, it loops on its own schedule, and its seek bar can be
+dragged, so the sound is told where the picture is and moves to meet it. Only
+once they are more than four tenths of a second apart, though: a clip that
+cannot be decoded at full speed plays slowly, and chasing that exactly would
+mean re-seeking several times a second, which is audible as damage rather than
+as synchronisation.
+
+Output is WASAPI in shared mode, so nothing else on the machine is silenced.
+Shared mode means the device dictates the format, which is handed to Media
+Foundation as it stands -- resampling and channel mixing are the part of audio
+most easily got subtly wrong, and Windows already has a resampler that is not
+subtly wrong.
 
 **The cache is capped.** Thumbnails live in
 `%LOCALAPPDATA%\mandala\thumbnails`, sharded by hash so no directory holds a

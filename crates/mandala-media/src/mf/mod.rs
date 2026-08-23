@@ -6,8 +6,10 @@
 //! the Video Processor MFT handles both colour conversion and scaling, which
 //! keeps that work off the CPU and means a full-size frame is never touched.
 
+pub mod audio;
 pub mod d3d;
 mod gpu;
+pub mod speaker;
 
 use crate::backend::{Advance, MediaBackend, VideoStream, VideoThumbnail, thumbnail_timestamp};
 use crate::com::ensure_thread_com;

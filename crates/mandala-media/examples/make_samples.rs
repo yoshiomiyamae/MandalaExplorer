@@ -6,6 +6,10 @@
 //! appears, a folder holding nothing, a folder holding only more folders, and
 //! a HEIC where Windows has the codec for one.
 //!
+//! The clips carry a tone, at a pitch that follows the seed. Silent samples
+//! cannot show whether the sound follows the pointer from one tile to the
+//! next, and a room full of identical beeps cannot either.
+//!
 //! ```
 //! cargo run -p mandala-media --example make_samples -- C:\some\folder 40
 //! ```
@@ -19,6 +23,8 @@ use windows::core::HSTRING;
 
 const FPS: u32 = 30;
 const FRAME_HNS: i64 = 10_000_000 / FPS as i64;
+const AUDIO_RATE: u32 = 48_000;
+const AUDIO_CHANNELS: u32 = 2;
 
 fn pack(a: u32, b: u32) -> u64 {
     ((a as u64) << 32) | b as u64
@@ -185,6 +191,26 @@ fn write_video(path: &Path, seed: u32) -> anyhow::Result<()> {
         output.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
         let stream = writer.AddStream(&output)?;
 
+        // Sound, so hovering one tile can be told from hovering another.
+        let audio_out = MFCreateMediaType()?;
+        audio_out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        audio_out.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+        audio_out.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
+        audio_out.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_RATE)?;
+        audio_out.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        audio_out.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16_000)?;
+        let audio = writer.AddStream(&audio_out)?;
+
+        let audio_in = MFCreateMediaType()?;
+        audio_in.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        audio_in.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+        audio_in.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, AUDIO_CHANNELS)?;
+        audio_in.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, AUDIO_RATE)?;
+        audio_in.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        audio_in.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, AUDIO_CHANNELS * 2)?;
+        audio_in.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AUDIO_RATE * AUDIO_CHANNELS * 2)?;
+        writer.SetInputMediaType(audio, &audio_in, None)?;
+
         let input = MFCreateMediaType()?;
         input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
@@ -227,7 +253,56 @@ fn write_video(path: &Path, seed: u32) -> anyhow::Result<()> {
             sample.SetSampleDuration(FRAME_HNS)?;
             writer.WriteSample(stream, &sample)?;
         }
+
+        write_tone(&writer, audio, seed, seconds)?;
         writer.Finalize()?;
+    }
+    Ok(())
+}
+
+/// Writes a tone lasting the whole clip.
+///
+/// The pitch comes from the seed and lands on a note of a scale, so a folder
+/// of these is possible to listen to while working out whether the sound
+/// follows the pointer.
+unsafe fn write_tone(
+    writer: &IMFSinkWriter,
+    stream: u32,
+    seed: u32,
+    seconds: u32,
+) -> anyhow::Result<()> {
+    use std::f32::consts::TAU;
+
+    // A pentatonic scale, so no two tiles clash however they are arranged.
+    const SEMITONES: [i32; 5] = [0, 2, 4, 7, 9];
+    let note = SEMITONES[(seed as usize) % SEMITONES.len()] + 12 * ((seed as i32 / 5) % 2);
+    let hz = 220.0 * 2f32.powf(note as f32 / 12.0);
+
+    let frames = AUDIO_RATE * seconds;
+    let mut pcm = Vec::with_capacity((frames * AUDIO_CHANNELS * 2) as usize);
+    for frame in 0..frames {
+        let t = frame as f32 / AUDIO_RATE as f32;
+        // Faded at both ends, so looping does not click.
+        let fade = (t / 0.05).min((seconds as f32 - t) / 0.05).clamp(0.0, 1.0);
+        let value = ((t * hz * TAU).sin() * 9000.0 * fade) as i16;
+        for _ in 0..AUDIO_CHANNELS {
+            pcm.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    unsafe {
+        let buffer = MFCreateMemoryBuffer(pcm.len() as u32)?;
+        let mut data: *mut u8 = std::ptr::null_mut();
+        buffer.Lock(&mut data, None, None)?;
+        std::slice::from_raw_parts_mut(data, pcm.len()).copy_from_slice(&pcm);
+        buffer.Unlock()?;
+        buffer.SetCurrentLength(pcm.len() as u32)?;
+
+        let sample = MFCreateSample()?;
+        sample.AddBuffer(&buffer)?;
+        sample.SetSampleTime(0)?;
+        sample.SetSampleDuration(seconds as i64 * 10_000_000)?;
+        writer.WriteSample(stream, &sample)?;
     }
     Ok(())
 }
