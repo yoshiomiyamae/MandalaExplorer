@@ -12,7 +12,7 @@ use mandala_core::layout::{GridLayout, TileSize};
 use mandala_core::schedule::{PlaybackCandidate, ScheduleParams, plan_playback};
 use mandala_core::slots::plan_slots;
 use mandala_core::sort::{Sort, SortKey, SortOrder, sort_entries};
-use mandala_core::{Entry, MediaKind, scan_dir};
+use mandala_core::{Entry, MediaKind, bookmarks, filter, scan_dir};
 use mandala_media::Frame;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -77,6 +77,9 @@ pub struct Settings {
     pub budget: usize,
     pub show_labels: bool,
     pub sort: Sort,
+    /// Folders worth coming back to, oldest first.
+    #[serde(default)]
+    pub bookmarks: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -88,6 +91,7 @@ impl Settings {
         }
         self.tile_px = self.tile_px.clamp(MIN_TILE_PX, MAX_TILE_PX);
         self.budget = self.budget.clamp(1, MAX_BUDGET);
+        self.bookmarks = bookmarks::sanitized(std::mem::take(&mut self.bookmarks));
         self
     }
 }
@@ -104,13 +108,26 @@ impl Default for Settings {
             budget: ScheduleParams::default().budget,
             show_labels: true,
             sort: Sort::default(),
+            bookmarks: Vec::new(),
         }
     }
 }
 
 pub struct MandalaApp {
     current_dir: PathBuf,
+    /// Everything the folder holds, as read from disk.
+    scanned: Vec<Entry>,
+    /// What the grid shows: `scanned`, narrowed by the filter and sorted.
+    ///
+    /// Two lists rather than one so that clearing the filter costs nothing and
+    /// needs no second trip to the disk -- and so every existing reader of
+    /// `entries` keeps meaning "the tiles on screen", which is what they all
+    /// wanted anyway.
     entries: Vec<Entry>,
+    /// What was typed into the filter box. Not persisted: an application that
+    /// starts up hiding most of a folder, for a reason recorded in a settings
+    /// file, is one nobody can debug from the outside.
+    filter: String,
     /// Bumped on every navigation, so frames decoded for the previous folder
     /// are recognisable as stale and dropped.
     generation: u64,
@@ -199,7 +216,9 @@ impl MandalaApp {
         let applied_sort = settings.sort;
         let mut app = Self {
             current_dir: PathBuf::new(),
+            scanned: Vec::new(),
             entries: Vec::new(),
+            filter: String::new(),
             generation: 0,
             error: None,
             path_edit: String::new(),
@@ -238,9 +257,14 @@ impl MandalaApp {
         self.hovered = None;
         self.visible = 0..0;
 
+        // Cleared on arrival. Carrying it into the next folder means opening
+        // one and being shown nothing, with the reason in a box further up that
+        // nobody is looking at.
+        self.filter.clear();
+
         match scan_dir(&path) {
             Ok(entries) => {
-                self.entries = entries;
+                self.scanned = entries;
                 self.error = None;
                 self.path_edit = path.display().to_string();
                 self.current_dir = path;
@@ -248,6 +272,7 @@ impl MandalaApp {
             }
             Err(e) => {
                 self.error = Some(format!("{}: {e}", path.display()));
+                self.scanned.clear();
                 self.entries.clear();
                 self.path_to_tile.clear();
                 self.unprobed.clear();
@@ -274,6 +299,16 @@ impl MandalaApp {
     /// down playback for each would mean nothing ever gets to play while a
     /// folder is being probed.
     fn resort(&mut self) {
+        // Narrowed first, then sorted: sorting what is about to be discarded is
+        // work for nothing, and on a folder of ten thousand files that is the
+        // difference between typing smoothly and typing into treacle.
+        self.entries = self
+            .scanned
+            .iter()
+            .filter(|e| filter::matches(&e.name, &self.filter))
+            .cloned()
+            .collect();
+
         let durations = &self.durations;
         sort_entries(&mut self.entries, self.settings.sort, |entry| {
             durations.get(&entry.path).copied().flatten()
@@ -315,7 +350,10 @@ impl MandalaApp {
 
     fn describe_contents(&self) -> String {
         let videos = self.entries.iter().filter(|e| e.kind == MediaKind::Video).count();
-        self.lang.item_summary(self.entries.len(), videos)
+        if self.filter.trim().is_empty() {
+            return self.lang.item_summary(self.entries.len(), videos);
+        }
+        self.lang.filtered_summary(self.entries.len(), self.scanned.len(), videos)
     }
 
     /// Notices the tile size crossing into another thumbnail tier.
@@ -540,6 +578,24 @@ impl MandalaApp {
                     self.navigate_to(parent);
                 }
 
+                // Before the path field, not after: that field is told to take
+                // every pixel left on the row, so anything following it is laid
+                // out with none and never appears at all.
+                //
+                // One button says whether this folder is kept and changes its
+                // mind, rather than two that are each wrong half the time.
+                let kept = bookmarks::contains(&self.settings.bookmarks, &self.current_dir);
+                let star = if kept { "\u{2605}" } else { "\u{2606}" };
+                let tip = if kept { Phrase::BookmarkRemove } else { Phrase::BookmarkAdd };
+                if ui.button(star).on_hover_text(self.lang.text(tip)).clicked() {
+                    let here = self.current_dir.clone();
+                    bookmarks::toggle(&mut self.settings.bookmarks, &here);
+                }
+
+                if let Some(chosen) = self.bookmark_menu(ui) {
+                    self.navigate_to(chosen);
+                }
+
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.path_edit).desired_width(f32::INFINITY),
                 );
@@ -588,11 +644,58 @@ impl MandalaApp {
                 ui.separator();
                 ui.checkbox(&mut self.settings.show_labels, self.lang.text(Phrase::Names));
 
+                ui.separator();
+                // The placeholder is the label: the row is crowded already, and
+                // a word repeated beside the box it belongs to earns nothing.
+                let typed = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .desired_width(180.0)
+                            .hint_text(self.lang.text(Phrase::Filter)),
+                    )
+                    .changed();
+                if typed {
+                    // Re-narrowing goes through the same path as re-sorting,
+                    // which already knows how to stand playback back up when
+                    // positions move underneath it.
+                    self.needs_resort = true;
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.summary);
                 });
             });
         });
+    }
+
+    /// Draws the bookmarks menu and reports the folder chosen from it.
+    ///
+    /// Returns rather than navigating, because navigating borrows all of
+    /// `self` and the menu is still holding part of it.
+    fn bookmark_menu(&self, ui: &mut Ui) -> Option<PathBuf> {
+        let mut chosen = None;
+        ui.menu_button(self.lang.text(Phrase::Bookmark), |ui| {
+            if self.settings.bookmarks.is_empty() {
+                ui.label(self.lang.text(Phrase::BookmarksEmpty));
+                return;
+            }
+            // Newest first: the folder just kept is the one most likely wanted
+            // again, and the list is oldest-first so that the cap drops the
+            // stalest rather than the freshest.
+            for path in self.settings.bookmarks.iter().rev() {
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                // The whole path on hover: two folders called `2026-08` are
+                // indistinguishable by name, which is the usual case here.
+                if ui.button(label).on_hover_text(path.display().to_string()).clicked() {
+                    chosen = Some(path.clone());
+                    ui.close();
+                }
+            }
+        });
+        chosen
     }
 
     /// The scrub strip for a tile, if there is anything to scrub.
@@ -1135,6 +1238,17 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_file_from_before_bookmarks_still_loads() {
+        // Someone updating from 0.2.0 has one of these. A missing field must
+        // read as "no bookmarks yet", not as a settings file the app throws
+        // away along with everything else in it.
+        let older = "(tile_px:300.0,autoplay:true,budget:8,show_labels:true,                     sort:(key:Name,order:Ascending))";
+        let decoded: Settings = ron::from_str(older).expect("an older file must still parse");
+        assert!(decoded.bookmarks.is_empty());
+        assert_eq!(decoded.budget, 8);
+    }
+
+    #[test]
     fn settings_survive_a_round_trip_through_serde() {
         let settings = Settings {
             tile_px: 480.0,
@@ -1142,6 +1256,7 @@ mod tests {
             budget: 7,
             show_labels: false,
             sort: Sort { key: SortKey::Size, order: SortOrder::Descending },
+            bookmarks: vec![PathBuf::from("photos"), PathBuf::from("clips")],
         };
         let encoded = ron::to_string(&settings).unwrap();
         let decoded: Settings = ron::from_str(&encoded).unwrap();
@@ -1149,6 +1264,7 @@ mod tests {
         assert_eq!(decoded.budget, 7);
         assert!(!decoded.autoplay);
         assert!(!decoded.show_labels);
+        assert_eq!(decoded.bookmarks.len(), 2, "bookmarks have to survive a restart");
         assert_eq!(decoded.sort.key, SortKey::Size);
         assert_eq!(decoded.sort.order, SortOrder::Descending);
     }
