@@ -31,12 +31,21 @@ env:
   # actionable without a second run.
   RUST_BACKTRACE: 1
 
+# Three jobs rather than one, because they are independent and a run then
+# costs the longest of them instead of the sum. Measured on a warm cache, the
+# single job took 473 seconds: 30 to lint, 212 to test, 119 to build, and the
+# rest setting up. Split, the release build finishes inside the time the tests
+# take and so costs nothing at all -- which is why it is still here. It catches
+# what a debug build does not, and dropping it would only move that discovery
+# to the tag, where it is expensive.
+#
+# The cost is three machines instead of one. Standard runners are free for
+# public repositories, so this is paid for in cache storage and nothing else.
 jobs:
-  check:
+  lint:
     # Windows only, and not by preference: decoding goes through Media
     # Foundation, so there is nothing to build anywhere else.
     runs-on: windows-latest
-
     steps:
       - uses: actions/checkout@v7
 
@@ -44,18 +53,34 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # Caches the registry and the dependency half of target/, which is most
-      # of the build: the first run took 25 minutes cold. Saved even when a
-      # step fails, so a red clippy run does not make the next one start over.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          # Named rather than left to default to the job name, so every job
+          # that compiles in the debug profile draws on one cache -- including
+          # the release workflow's, which used to start cold every time and
+          # spend fourteen minutes recompiling what had just been compiled
+          # here. A tag falls back to the default branch's caches, so the work
+          # this job saves is the work a release restores.
+          shared-key: debug
 
       - name: Format
         run: cargo fmt --check
 
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: debug
 
       # The Media Foundation tests synthesise an H.264 clip and decode it back.
       # A runner without an encoder, or without a GPU to make a D3D11 device on,
@@ -64,8 +89,23 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # Built but not kept. A release build catches what a debug one does not,
-      # and on a public repository an uploaded executable is a download link
-      # for anyone who finds the run -- which is the application being sold.
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # The release profile builds into its own directory and shares no
+          # artifacts with debug, so it needs a cache of its own -- shared in
+          # turn with the packaging job that a tag runs.
+          shared-key: release
+
+      # Built but not kept. On a public repository an uploaded executable is a
+      # download link for anyone who finds the run -- which is the application
+      # being sold.
       - name: Build
         run: cargo build --release -p mandala-app

@@ -1,6 +1,6 @@
 name: Release
 
-# Tagging is the whole trigger: `git tag v0.2.0 && git push --tags` produces a
+# Tagging is the whole trigger: `git tag v0.3.0 && git push --tags` produces a
 # release carrying the MSIX to upload to Partner Center. Submitting it is still
 # manual, because the Store's automated update path -- the msstore CLI and the
 # action that wraps it -- is documented as supporting free products only, and
@@ -9,57 +9,82 @@ on:
   push:
     tags: ['v*']
 
-# Creating a release writes to the repository. Nothing else here does.
+# Read by default; only the job that creates the release is given more.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Split the way CI is, and for the same reason: testing and packaging need
+# nothing from each other, so a release costs the longer of them rather than
+# both. It used to take 1338 seconds, of which 863 were tests that began by
+# compiling the whole tree from scratch -- the cache key included the job name,
+# so this workflow could never reach what CI had already built. The jobs below
+# name their caches after the profile instead, and a tag reads the default
+# branch's caches, so the tests here start from what the merge to main left
+# behind.
 jobs:
-  package:
-    runs-on: windows-latest
-
+  # Cheap and first: a tag that disagrees with the source is worth catching
+  # before anything spends a runner on it. No toolchain, so it costs seconds.
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      semver: ${{ steps.version.outputs.semver }}
+      package: ${{ steps.version.outputs.package }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read the version out of the tag
+        id: version
+        shell: bash
+        run: |
+          tag='${{ github.ref_name }}'
+          if [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag '$tag' is not vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          semver=${tag#v}
+          cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ -z $cargo ]]; then
+            echo 'Cargo.toml has no version line' >&2
+            exit 1
+          fi
+          if [[ $cargo != "$semver" ]]; then
+            echo "Tag says $semver but Cargo.toml says $cargo. Bump one of them." >&2
+            exit 1
+          fi
+          echo "Both say $semver"
+          echo "semver=$semver" >> "$GITHUB_OUTPUT"
+          # The manifest takes four parts and the Store insists the fourth is 0.
+          echo "package=$semver.0" >> "$GITHUB_OUTPUT"
 
+  # A release is the one build people install, so it is tested here rather than
+  # trusted to have passed on main. Nothing it produces is needed downstream --
+  # it is a veto, and it runs while the package is being built.
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-
-      - name: Read the version out of the tag
-        id: version
-        shell: pwsh
-        run: |
-          $tag = '${{ github.ref_name }}'
-          if ($tag -notmatch '^v(\d+)\.(\d+)\.(\d+)$') {
-            throw "Tag '$tag' is not vMAJOR.MINOR.PATCH"
-          }
-          $semver = $tag.Substring(1)
-          # The manifest takes four parts and the Store insists the fourth is 0.
-          "semver=$semver" >> $env:GITHUB_OUTPUT
-          "package=$semver.0" >> $env:GITHUB_OUTPUT
-
-      - name: The tag and Cargo.toml must agree
-        shell: pwsh
-        run: |
-          $line = Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1
-          if (-not $line) { throw 'Cargo.toml has no version line' }
-          $cargo = $line.Matches[0].Groups[1].Value
-          $tag = '${{ steps.version.outputs.semver }}'
-          if ($cargo -ne $tag) {
-            throw "Tag says $tag but Cargo.toml says $cargo. Bump one of them."
-          }
-          "Both say $tag"
-
-      # A release is the one build people install, so it is tested here rather
-      # than trusted to have passed on main. Public repositories run standard
-      # runners for free, so this costs waiting and nothing else.
+          shared-key: debug
       - name: Test
         run: cargo test --workspace
+
+  package:
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: release
 
       # build-msix.ps1 draws all 78 icon assets with Pillow rather than keeping
       # that many PNGs in the repository. The runner has Python; it does not
@@ -70,7 +95,7 @@ jobs:
       # This also runs cargo build --release, so there is no separate build step.
       - name: Package
         shell: pwsh
-        run: .\packaging\build-msix.ps1 -Version ${{ steps.version.outputs.package }}
+        run: .\packaging\build-msix.ps1 -Version ${{ needs.meta.outputs.package }}
 
       # The package has been stale before: an MSIX went to Partner Center
       # holding a binary five commits behind, and nothing said so. Comparing
@@ -85,36 +110,59 @@ jobs:
           }
           "Both are $built"
 
-      # The package only. The application is sold in the Store, and a release
-      # that hands out a ready-to-run executable undercuts that -- the source
-      # is MIT and anyone may build it, but building it is not the same as
-      # clicking a download link.
       - name: Name the asset after the version
         shell: pwsh
         run: |
-          $v = '${{ steps.version.outputs.semver }}'
-          Copy-Item target/msix/MandalaExplorer.msix "MandalaExplorer-$v.msix"
+          Copy-Item target/msix/MandalaExplorer.msix `
+            "MandalaExplorer-${{ needs.meta.outputs.semver }}.msix"
+
+      # Handed to the publishing job. The package only: the application is sold
+      # in the Store, and a release that hands out a ready-to-run executable
+      # undercuts that -- the source is MIT and anyone may build it, but
+      # building it is not the same as clicking a download link. The MSIX is
+      # published on the release page in a moment anyway, so carrying it
+      # between jobs exposes nothing that is not about to be public.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: msix
+          path: MandalaExplorer-${{ needs.meta.outputs.semver }}.msix
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    # Only after the tests have passed. Packaging alone is not enough to
+    # publish on: the package would be well-formed and possibly broken.
+    needs: [meta, verify, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: msix
 
       # gh is already on the runner, which saves depending on a third-party
       # action for one command.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+          VERSION: ${{ needs.meta.outputs.semver }}
+        shell: bash
         run: |
-          $v = '${{ steps.version.outputs.semver }}'
-          $notes = @"
+          notes=$(cat <<NOTES
           ## Files
 
           | | |
           | --- | --- |
-          | ``MandalaExplorer-$v.msix`` | The Store package, kept here so a submission can be traced back to the commit it came from. Deliberately unsigned: Partner Center signs it and rejects one that arrives signed, so it is not installable by double-clicking. |
+          | \`MandalaExplorer-$VERSION.msix\` | The Store package, kept here so a submission can be traced back to the commit it came from. Deliberately unsigned: Partner Center signs it and rejects one that arrives signed, so it is not installable by double-clicking. |
 
           To install the application, use [the Microsoft Store](https://apps.microsoft.com/detail/9P93GF7J2R94).
 
           Windows 10 version 2004 or later, 64-bit. Editions without Media Foundation (the N editions, unless the Media Feature Pack is installed) show still thumbnails and cannot play video.
-          "@
-          gh release create '${{ github.ref_name }}' `
-            "MandalaExplorer-$v.msix" `
-            --title "Mandala Explorer $v" `
-            --notes $notes
+          NOTES
+          )
+          gh release create "${{ github.ref_name }}" \
+            "MandalaExplorer-$VERSION.msix" \
+            --repo "${{ github.repository }}" \
+            --title "Mandala Explorer $VERSION" \
+            --notes "$notes"
