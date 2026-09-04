@@ -71,7 +71,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          shared-key: debug
+          # Written by CI's test job on main, not by its linter: see the note
+          # against that job for why the difference is worth 978 seconds.
+          shared-key: test
       - name: Test
         run: cargo test --workspace
 

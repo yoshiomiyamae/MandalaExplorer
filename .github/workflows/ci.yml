@@ -56,13 +56,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          # Named rather than left to default to the job name, so every job
-          # that compiles in the debug profile draws on one cache -- including
-          # the release workflow's, which used to start cold every time and
-          # spend fourteen minutes recompiling what had just been compiled
-          # here. A tag falls back to the default branch's caches, so the work
-          # this job saves is the work a release restores.
-          shared-key: debug
+          # Clippy gets a cache of its own, and must not share the one the
+          # tests use. It runs rustc through clippy-driver, which changes the
+          # fingerprint cargo records for every unit, so nothing it leaves
+          # behind can be reused by a plain cargo test -- and because this job
+          # is the quickest it would win the race to write a shared key and
+          # keep the tests' real artifacts from ever being saved. That is not
+          # a guess: v0.3.0's release restored a clippy-written cache, logged
+          # `full match: true`, and still spent 978 seconds compiling.
+          shared-key: lint
 
       - name: Format
         run: cargo fmt --check
@@ -80,7 +82,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          shared-key: debug
+          # Shared with the release workflow's tests, which is the point: a
+          # tag reads the default branch's caches, so what a merge to main
+          # compiles here is what a release starts from.
+          shared-key: test
 
       # The Media Foundation tests synthesise an H.264 clip and decode it back.
       # A runner without an encoder, or without a GPU to make a D3D11 device on,
