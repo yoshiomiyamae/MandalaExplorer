@@ -14,7 +14,7 @@ mandala-media.workspace = true
 
 anyhow.workspace = true
 crossbeam-channel.workspace = true
-dirs = "6"
+dirs = "7"
 eframe.workspace = true
 filetime = "0.2"
 egui.workspace = true
