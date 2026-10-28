@@ -14,10 +14,10 @@ mandala-media = { path = "crates/mandala-media" }
 anyhow = "1.0"
 blake3 = "1.8"
 crossbeam-channel = "0.5"
-eframe = { version = "0.36", features = ["persistence"] }
-egui = "0.36"
+eframe = { version = "0.37", features = ["persistence"] }
+egui = "0.37"
 image = "0.25"
-parking_lot = "0.12"
+parking_lot = "0.13"
 rayon = "1.12"
 serde = { version = "1.0", features = ["derive"] }
 walkdir = "2.5"
