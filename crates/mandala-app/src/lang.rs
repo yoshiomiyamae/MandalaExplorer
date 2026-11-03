@@ -102,6 +102,13 @@ fn system_tags() -> Vec<String> {
 /// compile error instead of a blank label someone notices in a screenshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phrase {
+    NewTab,
+    CloseTab,
+    SortByCount,
+    Rename,
+    Cancel,
+    Apply,
+    InvalidName,
     Size,
     Autoplay,
     AtOnce,
@@ -123,6 +130,7 @@ pub enum Phrase {
     Reload,
     Sound,
     SoundTip,
+    ZipPreviewOnly,
 }
 
 impl Language {
@@ -130,6 +138,26 @@ impl Language {
         use Language::{English, Japanese};
         use Phrase::*;
         match (self, phrase) {
+            (English, SortByCount) => "Files in folder",
+            (Japanese, SortByCount) => "フォルダー内のファイル数",
+            (English, Rename) => "Rename",
+            (Japanese, Rename) => "名前の変更",
+            (English, Cancel) => "Cancel",
+            (Japanese, Cancel) => "キャンセル",
+            (English, Apply) => "Apply",
+            (Japanese, Apply) => "変更",
+            (English, InvalidName) => "Enter a valid Windows file name.",
+            (Japanese, InvalidName) => "有効なファイル名を入力してください。",
+            (English, NewTab) => "Open this folder in a new tab",
+            (Japanese, NewTab) => "このフォルダーを新しいタブで開く",
+            (English, CloseTab) => "Close tab",
+            (Japanese, CloseTab) => "タブを閉じる",
+            (English, ZipPreviewOnly) => {
+                "ZIP folders support image previews only. Extract the file first to open it in another app."
+            }
+            (Japanese, ZipPreviewOnly) => {
+                "ZIP内は画像のプレビューに対応しています。別のアプリで開く場合は先にファイルを展開してください。"
+            }
             (English, Size) => "Size",
             (English, Autoplay) => "Autoplay",
             (English, AtOnce) => "at once",
@@ -184,6 +212,7 @@ impl Language {
             SortKey::Size => Phrase::SortBySize,
             SortKey::Modified => Phrase::SortByModified,
             SortKey::Duration => Phrase::SortByLength,
+            SortKey::FileCount => Phrase::SortByCount,
         })
     }
 
@@ -224,7 +253,15 @@ mod tests {
     use super::*;
 
     const ALL: [Language; 2] = [Language::English, Language::Japanese];
-    const PHRASES: [Phrase; 21] = [
+    const PHRASES: [Phrase; 29] = [
+        Phrase::SortByCount,
+        Phrase::Rename,
+        Phrase::Cancel,
+        Phrase::Apply,
+        Phrase::InvalidName,
+        Phrase::NewTab,
+        Phrase::CloseTab,
+        Phrase::ZipPreviewOnly,
         Phrase::Size,
         Phrase::Autoplay,
         Phrase::AtOnce,

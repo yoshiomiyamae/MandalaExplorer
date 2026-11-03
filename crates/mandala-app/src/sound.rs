@@ -96,6 +96,15 @@ impl SoundService {
             let _ = self.commands.send(Command::At(at));
         }
     }
+
+    /// OS audio/media reads cannot be interrupted by joining the Rust thread.
+    /// Disconnect its commands and let it clean up when that read returns.
+    pub fn shutdown(&mut self) {
+        let _ = self.commands.send(Command::Stop);
+        drop(std::mem::replace(&mut self.commands, unbounded().0));
+        drop(self.worker.take());
+        self.wanted = None;
+    }
 }
 
 impl Default for SoundService {
@@ -106,11 +115,7 @@ impl Default for SoundService {
 
 impl Drop for SoundService {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Stop);
-        drop(std::mem::replace(&mut self.commands, unbounded().0));
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -250,4 +255,31 @@ fn feed(device: &mut Speaker, state: &mut Playing) -> Result<()> {
     let written = device.write(&ready)?;
     state.queued.drain(..written);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_does_not_wait_for_a_blocked_audio_read() {
+        let (release, blocked) = crossbeam_channel::bounded::<()>(1);
+        let sound = SoundService {
+            commands: unbounded().0,
+            worker: Some(std::thread::spawn(move || {
+                let _ = blocked.recv();
+            })),
+            wanted: None,
+            reported: None,
+        };
+        let (finished, done) = crossbeam_channel::bounded(1);
+        let owner = std::thread::spawn(move || {
+            drop(sound);
+            let _ = finished.send(());
+        });
+        let returned = done.recv_timeout(Duration::from_secs(2)).is_ok();
+        let _ = release.send(());
+        owner.join().unwrap();
+        assert!(returned, "audio I/O must not prevent the window from closing");
+    }
 }

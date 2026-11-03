@@ -6,10 +6,16 @@
 
 mod app;
 mod cache;
+mod counts;
 mod fonts;
 mod lang;
+mod load;
 mod player;
+mod prefetch;
+mod selection;
+mod shell;
 mod sound;
+mod tabs;
 mod thumbs;
 
 use crate::lang::Language;
@@ -61,7 +67,7 @@ fn main() -> eframe::Result {
 
     let start = launch
         .start
-        .filter(|p| p.is_dir())
+        .filter(|p| p.is_dir() || mandala_core::archive::location(p).is_some())
         .or_else(dirs::picture_dir)
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("C:\\"));

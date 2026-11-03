@@ -32,6 +32,9 @@ release build has no console, and runs the app code optimised rather than at
 | Action | |
 | --- | --- |
 | Open a folder or file | double click |
+| Open a folder or ZIP in a new tab | Ctrl + double click |
+| Open the current folder in a new tab | the + button in the tab strip |
+| Switch or close a tab | click its name or its × button |
 | Go up | the arrow button, or Backspace |
 | Read the folder again | the circular arrow, or F5 |
 | Jump to a path | type it in the path box, Enter |
@@ -44,19 +47,95 @@ release build has no console, and runs the app code optimised rather than at
 | Narrow to some of the names | type in the filter box |
 | Keep a folder to come back to | the star, next to the path |
 | Go back to one | the Bookmarks button |
+| Select several files | Ctrl + click; Shift + click for a range; Ctrl + A for all shown |
+| Windows file menu | right click a file or folder |
+| Copy / cut / paste files | Ctrl + C / Ctrl + X / Ctrl + V |
+| Rename the selected file | F2 |
 
 Plain wheel scrolls, so resizing needs Ctrl held. Tile size, playback count,
-sort order and kept folders are remembered between runs, along with the window
-geometry. The filter is not: an application that starts up hiding most of a
+sort order, autoplay, sound and filename visibility are remembered separately
+for each directory, including folders inside ZIPs, across visits and restarts.
+New folders start with the settings you had before upgrading to per-directory
+views (the standard defaults on a fresh installation). Bookmarks and window
+geometry remain shared across directories. The filter is not saved: an
+application that starts up hiding most of a
 folder, for a reason written down in a settings file, is one nobody can work
 out from the outside. It clears when you open another folder, for the same
 reason.
+
+Each tab remembers its own scroll position for every folder visited during
+the session, so going up returns to where you left the parent folder. Switching
+tabs also restores the tab's filter. Tabs and scroll positions are not saved
+across restarts. Only the active tab decodes videos and plays audio.
+
+File operations use the Windows Shell, including its clipboard formats, so
+copy and paste work with File Explorer. Text fields keep their normal editing
+shortcuts. ZIP contents remain read-only: native file operations and external
+context menus are unavailable there. The native menu uses the classic Shell
+menu (the Windows 11 "Show more options" style), including installed extensions.
+
+"Files in folder" sorts directories by the number of immediate files, not
+subdirectories or descendants. ZIP folders follow the same rule. Counts are
+read on a background worker and applied as a batch; unknown or unreadable
+counts sort last in both directions. Counts are kept for the current listing
+and refreshed on navigation or F5. Files remain below directories.
+
+Size sorting also compares folders using recursive file-size totals. It is
+calculated only while sorting by size, on the same background worker, and
+cached for the current listing until navigation or F5. Symlinks and Windows
+reparse points (including junctions) are not followed. Unreadable or unfinished
+totals sort last in either direction. ZIP folders use uncompressed sizes from
+their directory metadata without extracting files; ZIP files encountered
+inside an ordinary directory contribute their on-disk file size instead.
 
 Reloading keeps the filter and the scroll position, and does not throw the
 thumbnails away: the disk cache is keyed on size and modification time, so a
 file that did not change comes back identical and one that did comes back
 different a moment later. Blanking the grid first would arrive at the same
 place, slower and with a flash.
+
+ZIP files open like read-only folders, including their subfolders. Images get
+thumbnails and folder mosaics, with the same sorting, filtering and bookmarks
+as ordinary folders. You can also enter `C:\photos.zip\holiday` in the path box.
+Only images are extracted, on demand, into temporary files removed after decoding.
+Videos and other files are listed but are not extracted or played. Opening ZIP
+members in another application, encrypted archives and nested ZIPs are not
+supported. Temporary image data is limited to 256 MiB per image and 512 MiB in
+total; generated thumbnails use the existing thumbnail cache.
+ZIP cover thumbnails are looked up using the archive's path, size and
+modification time, plus the thumbnail tier, before scanning the ZIP's contents.
+An unchanged archive can therefore reuse its cover without extracting images.
+
+Thumbnail requests cover the viewport and two extra rows above and below it.
+Once those requests finish and scrolling settles, low-priority work
+prefetches the other files and folder covers in the current filtered listing,
+starting just beyond the viewport. Prefetch stores disk thumbnails without
+uploading off-screen GPU textures. Requests scrolled off screen move to the end
+of a FIFO background queue and run after visible work. Every 500 ms the app
+samples Windows CPU utilisation and adjusts background parallelism: below 60%
+it adds one slot, at 85% or above it halves the limit (down to zero), and between
+those thresholds it holds steady or resumes with one slot after a pause. These
+are initial policy thresholds, not hardware-calibrated values. At least one
+thumbnail worker is reserved for visible work; background parallelism can reach
+seven on the largest eight-worker pool. Visible requests immediately pause new
+background starts, while running jobs finish normally. If CPU readings are
+unavailable, the fallback is one background worker. GPU utilisation and storage
+latency are not measured by this policy.
+Returning to a tile promotes its queued request; an already running background
+decode can deliver its result directly to that visible tile. Duplicate requests
+are merged, and there is no request-count limit that drops older jobs. The
+queue retains unique requests for the current folder and thumbnail tier.
+Navigation and reload cancel the old queue; changing thumbnail tiers cancels
+obsolete sizes. Sorting preserves deferred work. A job already decoding is
+allowed to finish. Prefetch periodically sweeps the disk
+cache using the existing 2 GB limit. Folder covers inspect only the usual
+bounded selection of children, not an entire recursive directory tree.
+
+Video workers retain only the latest unconsumed frame per playback slot, so a
+paused or closing UI cannot accumulate a backlog of decoded images. Closing
+disconnects playback, audio and thumbnail work before dropping the UI's
+resources. It does not join threads blocked in Windows media or network I/O;
+those threads stop at their next cancellation boundary, or when the process exits.
 
 Filtering takes several words, and every one of them has to appear somewhere in
 the name, in any order -- `beach 2026` finds `2026-08-beach-trip.jpg`. Case is

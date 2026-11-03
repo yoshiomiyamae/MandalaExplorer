@@ -3,6 +3,7 @@
 
 use crate::lang::{Language, Phrase};
 use crate::player::{PlaybackService, SlotEvent};
+use crate::prefetch::Prefetch;
 use crate::thumbs::{Job, ThumbnailService, thumbnail_tier};
 use eframe::egui::{
     self, Align2, Color32, Context, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, TextureHandle,
@@ -11,10 +12,10 @@ use eframe::egui::{
 use mandala_core::layout::{GridLayout, TileSize};
 use mandala_core::schedule::{PlaybackCandidate, ScheduleParams, plan_playback};
 use mandala_core::slots::plan_slots;
-use mandala_core::sort::{Sort, SortKey, SortOrder, sort_entries};
+use mandala_core::sort::{Sort, SortKey, SortOrder, sort_entries_with_folder_stats};
 use mandala_core::{Entry, MediaKind, bookmarks, filter, scan_dir};
 use mandala_media::Frame;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -86,17 +87,107 @@ pub struct Settings {
     /// pointer crossed it is not one anyone would leave open.
     #[serde(default)]
     pub sound: bool,
+    /// Captured once from the legacy settings, before the first folder opens.
+    directory_defaults: Option<DirectorySettings>,
+    directories: BTreeMap<PathBuf, DirectorySettings>,
+    /// Keep the key while open, including if a network share disconnects.
+    #[serde(skip)]
+    active_directory: Option<(PathBuf, PathBuf)>,
 }
 
-impl Settings {
-    /// Clamps values loaded from disk. A settings file edited by hand, or left
-    /// over from a version with different limits, must not wedge the grid.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct DirectorySettings {
+    tile_px: f32,
+    autoplay: bool,
+    budget: usize,
+    show_labels: bool,
+    sort: Sort,
+    sound: bool,
+}
+
+impl Default for DirectorySettings {
+    fn default() -> Self {
+        Settings::default().view()
+    }
+}
+
+impl DirectorySettings {
     fn sanitized(mut self) -> Self {
         if !self.tile_px.is_finite() {
             self.tile_px = Self::default().tile_px;
         }
         self.tile_px = self.tile_px.clamp(MIN_TILE_PX, MAX_TILE_PX);
         self.budget = self.budget.clamp(1, MAX_BUDGET);
+        self
+    }
+}
+
+/// Resolve aliases on navigation, never on every frame. ZIP members have no
+/// filesystem identity of their own, so resolve their archive instead.
+fn directory_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    if let Some((archive, member)) = mandala_core::archive::location(path)
+        && let Ok(canonical) = std::fs::canonicalize(archive)
+    {
+        return canonical.join(member);
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+impl Settings {
+    fn view(&self) -> DirectorySettings {
+        DirectorySettings {
+            tile_px: self.tile_px,
+            autoplay: self.autoplay,
+            budget: self.budget,
+            show_labels: self.show_labels,
+            sort: self.sort,
+            sound: self.sound,
+        }
+    }
+
+    fn apply_view(&mut self, view: DirectorySettings) {
+        self.tile_px = view.tile_px;
+        self.autoplay = view.autoplay;
+        self.budget = view.budget;
+        self.show_labels = view.show_labels;
+        self.sort = view.sort;
+        self.sound = view.sound;
+    }
+
+    fn remember_directory(&mut self, path: &Path) {
+        if !path.as_os_str().is_empty() {
+            let key = self
+                .active_directory
+                .as_ref()
+                .filter(|(active, _)| active == path)
+                .map(|(_, key)| key.clone())
+                .unwrap_or_else(|| directory_key(path));
+            self.directories.insert(key, self.view().sanitized());
+        }
+    }
+
+    fn enter_directory(&mut self, previous: &Path, next: &Path) {
+        let initial = self.view().sanitized();
+        let defaults = *self.directory_defaults.get_or_insert(initial);
+        self.remember_directory(previous);
+        let key = directory_key(next);
+        let view = self.directories.get(&key).copied().unwrap_or(defaults);
+        self.apply_view(view);
+        self.active_directory = Some((next.to_path_buf(), key));
+    }
+
+    /// Clamps values loaded from disk. A settings file edited by hand, or left
+    /// over from a version with different limits, must not wedge the grid.
+    fn sanitized(mut self) -> Self {
+        self.apply_view(self.view().sanitized());
+        self.directory_defaults = self.directory_defaults.map(DirectorySettings::sanitized);
+        for view in self.directories.values_mut() {
+            *view = view.sanitized();
+        }
         self.bookmarks = bookmarks::sanitized(std::mem::take(&mut self.bookmarks));
         self
     }
@@ -116,11 +207,26 @@ impl Default for Settings {
             sort: Sort::default(),
             bookmarks: Vec::new(),
             sound: false,
+            directory_defaults: None,
+            directories: BTreeMap::new(),
+            active_directory: None,
         }
     }
 }
 
 pub struct MandalaApp {
+    clipboard_keys: crate::shell::ClipboardKeys,
+    selection: crate::selection::Selection,
+    rename_edit: Option<(PathBuf, String, bool)>,
+    operation_error: Option<String>,
+    counts: crate::counts::Counts,
+    file_counts: HashMap<PathBuf, Option<u64>>,
+    folder_sizes: HashMap<PathBuf, Option<u64>>,
+    count_request: Option<(SortKey, u64)>,
+    tabs: Vec<crate::tabs::Tab>,
+    active_tab: usize,
+    scroll_offset: f32,
+    restore_scroll: Option<f32>,
     current_dir: PathBuf,
     /// Everything the folder holds, as read from disk.
     scanned: Vec<Entry>,
@@ -162,6 +268,8 @@ pub struct MandalaApp {
     /// separate set of failures would only be a subset of this one.
     requested_thumbs: HashSet<(PathBuf, u32)>,
     requested_durations: HashSet<PathBuf>,
+    prefetch: Prefetch,
+    thumbnail_view: Option<(std::ops::Range<usize>, u32)>,
     /// Videos still to probe for length, newest folder first. Refilled on
     /// navigation and re-sort, so a folder whose lengths are all known costs
     /// nothing per frame.
@@ -212,6 +320,7 @@ impl MandalaApp {
         let repaint = move || ctx.request_repaint();
 
         let thumbs = ThumbnailService::new(backend, repaint.clone());
+        let counts = crate::counts::Counts::new(repaint.clone());
         let mut player = PlaybackService::new(backend, repaint);
 
         let settings = cc
@@ -223,6 +332,18 @@ impl MandalaApp {
 
         let applied_sort = settings.sort;
         let mut app = Self {
+            clipboard_keys: crate::shell::ClipboardKeys::new(cc)?,
+            selection: Default::default(),
+            rename_edit: None,
+            operation_error: None,
+            counts,
+            file_counts: HashMap::new(),
+            folder_sizes: HashMap::new(),
+            count_request: None,
+            tabs: vec![crate::tabs::Tab::default()],
+            active_tab: 0,
+            scroll_offset: 0.0,
+            restore_scroll: None,
             current_dir: PathBuf::new(),
             scanned: Vec::new(),
             entries: Vec::new(),
@@ -239,6 +360,8 @@ impl MandalaApp {
             durations: HashMap::new(),
             requested_thumbs: HashSet::new(),
             requested_durations: HashSet::new(),
+            prefetch: Prefetch::default(),
+            thumbnail_view: None,
             unprobed: Vec::new(),
             summary: String::new(),
             current_tier: 0,
@@ -257,8 +380,19 @@ impl MandalaApp {
     }
 
     fn navigate_to(&mut self, path: PathBuf) {
+        self.remember_tab();
+        self.selection = Default::default();
+        self.rename_edit = None;
+        self.operation_error = None;
+        self.counts.cancel();
+        self.count_request = None;
+        self.file_counts.clear();
+        self.folder_sizes.clear();
+        self.thumbs.clear_pending();
+        self.prefetch.reset(0);
         self.generation += 1;
         self.stop_playback();
+        self.sound.follow(None, Duration::ZERO);
         self.thumb_textures.clear();
         self.requested_thumbs.clear();
         self.requested_durations.clear();
@@ -273,10 +407,14 @@ impl MandalaApp {
 
         match scan_dir(&path) {
             Ok(entries) => {
+                self.settings.enter_directory(&self.current_dir, &path);
                 self.scanned = entries;
                 self.error = None;
                 self.path_edit = path.display().to_string();
                 self.current_dir = path;
+                self.scroll_offset = self.tabs[self.active_tab].offset(&self.current_dir);
+                self.restore_scroll = Some(self.scroll_offset);
+                self.settle = ScrollSettle::default();
                 self.resort();
             }
             Err(e) => {
@@ -287,6 +425,191 @@ impl MandalaApp {
                 self.unprobed.clear();
                 self.summary.clear();
             }
+        }
+    }
+
+    fn remember_tab(&mut self) {
+        if !self.current_dir.as_os_str().is_empty() {
+            self.tabs[self.active_tab].remember(
+                self.current_dir.clone(),
+                self.filter.clone(),
+                self.scroll_offset,
+            );
+        }
+    }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        self.entries
+            .iter()
+            .filter(|e| self.selection.paths.contains(&e.path))
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    fn begin_rename(&mut self) {
+        let paths = self.selected_paths();
+        if paths.len() == 1 && mandala_core::archive::location(&self.current_dir).is_none() {
+            let path = paths[0].clone();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            self.rename_edit = Some((path, name, true));
+        }
+    }
+
+    fn file_shortcuts(&mut self, ctx: &Context, frame: &eframe::Frame) {
+        let native_paste = self.clipboard_keys.take_paste();
+        if ctx.text_edit_focused() || self.rename_edit.is_some() {
+            return;
+        }
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A)) {
+            self.selection.paths = self.entries.iter().map(|e| e.path.clone()).collect();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
+            self.begin_rename();
+        }
+        if mandala_core::archive::location(&self.current_dir).is_some() {
+            return;
+        }
+        let action = ctx.input(|i| {
+            let key = |key| i.modifiers.ctrl && i.key_pressed(key);
+            if key(egui::Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
+                Some(crate::shell::Action::Copy)
+            } else if key(egui::Key::X) || i.events.iter().any(|e| matches!(e, egui::Event::Cut)) {
+                Some(crate::shell::Action::Cut)
+            } else if native_paste
+                || key(egui::Key::V)
+                || i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))
+            {
+                Some(crate::shell::Action::Paste)
+            } else {
+                None
+            }
+        });
+        if let Some(action) = action {
+            let paths = self.selected_paths();
+            if paths.is_empty() && !matches!(action, crate::shell::Action::Paste) {
+                return;
+            }
+            match crate::shell::action(frame, action, &paths, &self.current_dir) {
+                Ok(()) if matches!(action, crate::shell::Action::Paste) => self.reload(),
+                Ok(()) => {}
+                Err(e) => self.operation_error = Some(e.to_string()),
+            }
+        }
+    }
+
+    fn rename_dialog(&mut self, ctx: &Context, frame: &eframe::Frame) {
+        let Some((path, mut name, focus)) = self.rename_edit.take() else { return };
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("rename-file")).show(ctx, |ui| {
+            ui.heading(self.lang.text(Phrase::Rename));
+            ui.label(path.display().to_string());
+            let edit = ui.text_edit_singleline(&mut name);
+            if focus {
+                edit.request_focus();
+            }
+            let valid = crate::selection::valid_name(&name);
+            if !valid {
+                ui.colored_label(ui.visuals().error_fg_color, self.lang.text(Phrase::InvalidName));
+            }
+            ui.horizontal(|ui| {
+                apply = ui
+                    .add_enabled(valid, egui::Button::new(self.lang.text(Phrase::Apply)))
+                    .clicked()
+                    || (valid && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                cancel = ui.button(self.lang.text(Phrase::Cancel)).clicked()
+                    || ui.input(|i| i.key_pressed(egui::Key::Escape));
+            });
+        });
+        if apply {
+            match crate::shell::rename(frame, &path, &name) {
+                Ok(()) => self.reload(),
+                Err(e) => {
+                    self.operation_error = Some(e.to_string());
+                    self.rename_edit = Some((path, name, false));
+                }
+            }
+        } else if !cancel {
+            self.rename_edit = Some((path, name, false));
+        }
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if index == self.active_tab || index >= self.tabs.len() {
+            return;
+        }
+        self.remember_tab();
+        self.settings.remember_directory(&self.current_dir);
+        self.current_dir = PathBuf::new();
+        self.active_tab = index;
+        let path = self.tabs[index].path.clone();
+        let filter = self.tabs[index].filter.clone();
+        self.navigate_to(path.clone());
+        // Keep a failed tab address usable for retrying or navigating upward.
+        if self.current_dir.as_os_str().is_empty() {
+            self.path_edit = path.display().to_string();
+            self.current_dir = path;
+        }
+        self.filter = filter;
+        self.resort();
+    }
+
+    fn open_tab(&mut self, path: PathBuf) {
+        self.remember_tab();
+        let mut tab = crate::tabs::Tab::default();
+        tab.path = path;
+        self.tabs.push(tab);
+        self.switch_tab(self.tabs.len() - 1);
+    }
+
+    fn tab_bar(&mut self, ui: &mut Ui) {
+        let mut selected = None;
+        let mut closed = None;
+        let mut duplicate = false;
+        egui::Panel::top("tabs").show(ui, |ui| {
+            egui::ScrollArea::horizontal().id_salt("tab-strip").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, tab) in self.tabs.iter().enumerate() {
+                        let path =
+                            if index == self.active_tab { &self.current_dir } else { &tab.path };
+                        let label = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                        ui.push_id(index, |ui| {
+                            if ui
+                                .selectable_label(index == self.active_tab, label)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                selected = Some(index);
+                            }
+                            if self.tabs.len() > 1
+                                && ui
+                                    .small_button("×")
+                                    .on_hover_text(self.lang.text(Phrase::CloseTab))
+                                    .clicked()
+                            {
+                                closed = Some(index);
+                            }
+                        });
+                    }
+                    duplicate =
+                        ui.button("+").on_hover_text(self.lang.text(Phrase::NewTab)).clicked();
+                });
+            });
+        });
+        if let Some(index) = selected {
+            self.switch_tab(index);
+        }
+        if let Some(index) = closed {
+            if index == self.active_tab {
+                self.switch_tab(if index > 0 { index - 1 } else { 1 });
+            }
+            self.tabs.remove(index);
+            if index < self.active_tab {
+                self.active_tab -= 1;
+            }
+        }
+        if duplicate {
+            self.open_tab(self.current_dir.clone());
         }
     }
 
@@ -307,9 +630,14 @@ impl MandalaApp {
     /// position map is rebuilt from what is still there, and eviction goes by
     /// that map.
     fn reload(&mut self) {
+        self.counts.cancel();
+        self.count_request = None;
+        self.file_counts.clear();
+        self.folder_sizes.clear();
         let here = self.current_dir.clone();
         match scan_dir(&here) {
             Ok(entries) => {
+                self.thumbs.clear_pending();
                 self.scanned = entries;
                 self.error = None;
                 // Asked for again rather than assumed unchanged. A file whose
@@ -364,9 +692,38 @@ impl MandalaApp {
             .collect();
 
         let durations = &self.durations;
-        sort_entries(&mut self.entries, self.settings.sort, |entry| {
-            durations.get(&entry.path).copied().flatten()
-        });
+        sort_entries_with_folder_stats(
+            &mut self.entries,
+            self.settings.sort,
+            |entry| durations.get(&entry.path).copied().flatten(),
+            |entry| self.file_counts.get(&entry.path).copied().flatten(),
+            |entry| self.folder_sizes.get(&entry.path).copied().flatten(),
+        );
+        let present: HashSet<_> = self.entries.iter().map(|e| &e.path).collect();
+        self.selection.paths.retain(|path| present.contains(path));
+        let key = self.settings.sort.key;
+        if matches!(key, SortKey::FileCount | SortKey::Size)
+            && self.count_request.is_none_or(|(requested, _)| requested != key)
+        {
+            let cache = if key == SortKey::Size { &self.folder_sizes } else { &self.file_counts };
+            let paths: Vec<_> = self
+                .scanned
+                .iter()
+                .filter(|e| e.is_dir() && !cache.contains_key(&e.path))
+                .map(|e| e.path.clone())
+                .collect();
+            if !paths.is_empty() {
+                let metric = if key == SortKey::Size {
+                    crate::counts::Metric::Size
+                } else {
+                    crate::counts::Metric::FileCount
+                };
+                self.count_request = Some((key, self.counts.request(metric, paths)));
+            }
+        } else if !matches!(key, SortKey::FileCount | SortKey::Size) {
+            self.counts.cancel();
+            self.count_request = None;
+        }
 
         if order_changed(&self.entries, &self.path_to_tile) {
             self.path_to_tile = self
@@ -378,6 +735,7 @@ impl MandalaApp {
             self.stop_playback();
         }
         self.refresh_probe_queue();
+        self.reset_prefetch();
         self.summary = self.describe_contents();
         self.applied_sort = self.settings.sort;
         self.needs_resort = false;
@@ -421,6 +779,7 @@ impl MandalaApp {
             return;
         }
         self.current_tier = tier;
+        self.reset_prefetch();
         // Requests are keyed by tier, so work already in flight keeps its
         // record and is not queued a second time by the next frame. Dragging
         // the slider across a boundary used to re-request the whole visible
@@ -435,6 +794,8 @@ impl MandalaApp {
         let Some(entry) = self.entries.get(index) else { return };
         if entry.is_dir() {
             self.navigate_to(entry.path.clone());
+        } else if mandala_core::archive::location(&entry.path).is_some() {
+            self.error = Some(self.lang.text(Phrase::ZipPreviewOnly).to_owned());
         } else {
             // explorer.exe hands the file to whatever is registered for it.
             let _ = std::process::Command::new("explorer.exe").arg(&entry.path).spawn();
@@ -442,24 +803,64 @@ impl MandalaApp {
     }
 
     fn collect_results(&mut self, ctx: &Context) {
+        for (id, counts) in self.counts.results.try_iter() {
+            if let Some((key, requested)) = self.count_request
+                && requested == id
+            {
+                if key == SortKey::Size {
+                    self.folder_sizes.extend(counts);
+                } else {
+                    self.file_counts.extend(counts);
+                }
+                if self.settings.sort.key == key {
+                    self.needs_resort = true;
+                }
+            }
+        }
         for done in self.thumbs.drain().collect::<Vec<_>>() {
+            if done.prefetch_epoch.is_some_and(|epoch| epoch != self.prefetch.epoch) {
+                continue;
+            }
+            if done.tier == Some(self.current_tier) {
+                self.prefetch.completed(done.path.clone());
+            }
             if let Some(duration) = done.duration {
                 // A newly learned length can change where its tile belongs.
                 let known = self.durations.insert(done.path.clone(), Some(duration));
                 if known != Some(Some(duration)) && self.settings.sort.key.needs_probe() {
                     self.needs_resort = true;
                 }
-            } else if self.requested_durations.contains(&done.path) {
+            } else if done.prefetch_epoch.is_none() && self.requested_durations.contains(&done.path)
+            {
                 // Asked and there is none; remembered so it is not asked again.
                 self.durations.entry(done.path.clone()).or_insert(None);
             }
 
+            if !self.path_to_tile.contains_key(&done.path) {
+                if let Some(tier) = done.tier {
+                    self.requested_thumbs.remove(&(done.path, tier));
+                }
+                continue;
+            }
+
             // A failure needs no record of its own: the request set already
             // stops it being asked for again within this tier.
-            if let Some(Ok(frame)) = done.thumbnail {
-                let name = done.path.to_string_lossy().into_owned();
-                let texture = upload(ctx, &name, &frame);
-                self.thumb_textures.insert(done.path, texture);
+            if let Some(thumbnail) = done.thumbnail {
+                let on_screen = self
+                    .path_to_tile
+                    .get(&done.path)
+                    .is_some_and(|index| self.visible.contains(index));
+                if done.tier == Some(self.current_tier) && on_screen {
+                    if let Ok(frame) = thumbnail {
+                        let name = done.path.to_string_lossy().into_owned();
+                        let texture = upload(ctx, &name, &frame);
+                        self.thumb_textures.insert(done.path, texture);
+                    }
+                } else if let Some(tier) = done.tier {
+                    // The result is cached on disk. Re-request it when visible,
+                    // rather than uploading late results outside the keep range.
+                    self.requested_thumbs.remove(&(done.path, tier));
+                }
             }
         }
 
@@ -494,6 +895,19 @@ impl MandalaApp {
     /// Asks for the thumbnails of everything on screen that lacks one.
     fn request_visible_thumbnails(&mut self) {
         let tier = self.current_tier;
+        let view = (self.visible.clone(), tier);
+        if self.thumbnail_view.as_ref() != Some(&view) {
+            let visible =
+                self.entries[self.visible.clone()].iter().map(|entry| entry.path.clone()).collect();
+            for deferred in self.thumbs.defer_outside(&visible, tier, self.prefetch.epoch) {
+                release_request_marker(
+                    deferred,
+                    &mut self.requested_thumbs,
+                    &mut self.requested_durations,
+                );
+            }
+            self.thumbnail_view = Some(view);
+        }
         for index in self.visible.clone() {
             let Some(entry) = self.entries.get(index) else { continue };
             if !entry.kind.has_thumbnail()
@@ -534,6 +948,45 @@ impl MandalaApp {
         for (path, job) in jobs {
             self.requested_durations.insert(path);
             self.thumbs.request(job);
+        }
+    }
+
+    fn reset_prefetch(&mut self) {
+        self.prefetch.reset(self.entries.len());
+        self.thumbs.rebase_background(self.prefetch.epoch, self.current_tier);
+        self.thumbnail_view = None;
+    }
+
+    fn request_prefetch(&mut self, ctx: &Context, settled: bool) {
+        self.thumbs.update_load(Instant::now());
+        if self.prefetch.has_remaining() || self.thumbs.has_work() {
+            ctx.request_repaint_after(crate::load::LOAD_INTERVAL);
+        }
+        if !settled {
+            return;
+        }
+        for _ in 0..self.thumbs.prefetch_capacity() {
+            if let Some(index) = self.prefetch.next(
+                &self.entries,
+                self.visible.clone(),
+                &self.requested_thumbs,
+                self.current_tier,
+            ) {
+                let entry = &self.entries[index];
+                if !self
+                    .thumbs
+                    .prefetch(Job::thumbnail(entry, self.current_tier), self.prefetch.epoch)
+                {
+                    self.prefetch.retry(entry.path.clone(), index);
+                    break;
+                }
+            } else {
+                if self.prefetch.has_remaining() {
+                    // Only needed when a bounded planning pass skipped 64 entries.
+                    ctx.request_repaint();
+                }
+                break;
+            }
         }
     }
 
@@ -805,6 +1258,14 @@ impl MandalaApp {
         let background =
             if hovered { visuals.widgets.hovered.bg_fill } else { visuals.extreme_bg_color };
         painter.rect_filled(rect, CornerRadius::same(6), background);
+        if self.selection.paths.contains(&entry.path) {
+            painter.rect_stroke(
+                rect.shrink(1.0),
+                CornerRadius::same(6),
+                Stroke::new(2.0, visuals.selection.stroke.color),
+                egui::StrokeKind::Inside,
+            );
+        }
 
         let image_area = self.image_area(rect);
 
@@ -863,12 +1324,22 @@ impl MandalaApp {
     }
 }
 
+impl Drop for MandalaApp {
+    fn drop(&mut self) {
+        // Stop every producer before fields are dropped in declaration order.
+        self.player.shutdown();
+        self.sound.shutdown();
+        self.thumbs.shutdown();
+    }
+}
+
 impl eframe::App for MandalaApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.settings.remember_directory(&self.current_dir);
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.collect_results(&ctx);
 
@@ -878,12 +1349,25 @@ impl eframe::App for MandalaApp {
         self.settings.tile_px = zoomed_tile_size(self.settings.tile_px, zoom);
 
         self.top_bar(ui);
+        self.tab_bar(ui);
+        if let Some(error) = self.operation_error.clone() {
+            egui::Panel::top("file-operation-error").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                    if ui.small_button("×").clicked() {
+                        self.operation_error = None;
+                    }
+                });
+            });
+        }
+        self.file_shortcuts(&ctx, frame);
 
         // Backspace belongs to whatever text field has focus. Taken globally
         // it did both: the field deleted a character and the folder changed,
         // and changing folder rewrites the path box with the new path -- so
         // one press looked like several characters vanishing at once.
-        if !ctx.text_edit_focused()
+        if self.rename_edit.is_none()
+            && !ctx.text_edit_focused()
             && ctx.input(|i| i.key_pressed(egui::Key::Backspace))
             && let Some(parent) = self.parent_dir()
         {
@@ -892,11 +1376,12 @@ impl eframe::App for MandalaApp {
 
         // F5 because that is what every file browser and every browser uses,
         // and nobody should have to find the button.
-        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+        if self.rename_edit.is_none() && ctx.input(|i| i.key_pressed(egui::Key::F5)) {
             self.reload();
         }
 
         let mut activated = None;
+        let mut context_requested = false;
         let mut hovered_now = None;
         let mut seek_request = None;
 
@@ -909,71 +1394,82 @@ impl eframe::App for MandalaApp {
             let target = TileSize::square(self.settings.tile_px);
             let count = self.entries.len();
 
-            egui::ScrollArea::vertical().auto_shrink([false; 2]).show_viewport(
-                ui,
-                |ui, viewport| {
-                    // Measured inside the scroll area, where the width already has
-                    // the scrollbar taken out of it.
-                    let layout = GridLayout::stretched(ui.available_width(), target, GAP, PADDING);
-                    let tile = layout.tile();
-                    ui.set_height(layout.content_height(count));
-                    let origin = ui.min_rect().min;
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt(("files", self.active_tab))
+                .auto_shrink([false; 2]);
+            if let Some(offset) = self.restore_scroll.take() {
+                scroll = scroll.vertical_scroll_offset(offset);
+            }
+            let output = scroll.show_viewport(ui, |ui, viewport| {
+                // Measured inside the scroll area, where the width already has
+                // the scrollbar taken out of it.
+                let layout = GridLayout::stretched(ui.available_width(), target, GAP, PADDING);
+                let tile = layout.tile();
+                ui.set_height(layout.content_height(count));
+                let origin = ui.min_rect().min;
 
-                    self.visible = layout.visible_indices(
-                        viewport.min.y,
-                        viewport.height(),
-                        count,
-                        OVERSCAN_ROWS,
-                    );
+                self.visible =
+                    layout.visible_indices(viewport.min.y, viewport.height(), count, OVERSCAN_ROWS);
 
-                    for index in self.visible.clone() {
-                        let (x, y) = layout.tile_origin(index);
-                        let rect = Rect::from_min_size(
-                            origin + Vec2::new(x, y),
-                            Vec2::new(tile.w, tile.h),
-                        );
-                        let response =
-                            ui.interact(rect, ui.id().with(("tile", index)), Sense::click());
-                        let mut hovering = response.hovered();
-                        if response.double_clicked() {
-                            activated = Some(index);
+                for index in self.visible.clone() {
+                    let (x, y) = layout.tile_origin(index);
+                    let rect =
+                        Rect::from_min_size(origin + Vec2::new(x, y), Vec2::new(tile.w, tile.h));
+                    let response = ui.interact(rect, ui.id().with(("tile", index)), Sense::click());
+                    let mut hovering = response.hovered();
+                    if response.clicked() {
+                        let modifiers = ui.input(|i| i.modifiers);
+                        let paths: Vec<_> = self.entries.iter().map(|e| e.path.clone()).collect();
+                        self.selection.click(&paths, index, modifiers.ctrl, modifiers.shift);
+                    }
+                    if response.secondary_clicked() {
+                        if !self.selection.paths.contains(&self.entries[index].path) {
+                            let paths: Vec<_> =
+                                self.entries.iter().map(|e| e.path.clone()).collect();
+                            self.selection.click(&paths, index, false, false);
                         }
-
-                        // The scrub strip sits on top of the tile, so it is claimed
-                        // after it and hands hover back to the tile -- otherwise
-                        // pointing at the bar would stop the video playing.
-                        if let Some((bar, _, total)) = self.seek_bar(index, rect) {
-                            let bar_response = ui.interact(
-                                bar,
-                                ui.id().with(("seek", index)),
-                                Sense::click_and_drag(),
-                            );
-                            if bar_response.hovered() {
-                                hovering = true;
-                            }
-                            if let Some(pointer) = bar_response.interact_pointer_pos() {
-                                hovering = true;
-                                seek_request = Some((index, seek_position(bar, pointer.x, total)));
-                            }
-                        }
-
-                        if hovering {
-                            hovered_now = Some(index);
-                        }
-                        self.draw_tile(ui, index, rect, hovering);
+                        context_requested = true;
+                    }
+                    if response.double_clicked() {
+                        activated = Some((index, ui.input(|i| i.modifiers.ctrl)));
                     }
 
-                    let center = viewport.min.y + viewport.height() / 2.0;
-                    let settled = self.settle.update(viewport.min.y, Instant::now());
-                    self.hovered = hovered_now;
-                    self.follow_sound();
-                    self.retier_thumbnails();
-                    self.request_visible_thumbnails();
-                    self.request_missing_durations();
-                    self.schedule_playback(&layout, center, settled);
-                    self.trim_textures(&layout);
-                },
-            );
+                    // The scrub strip sits on top of the tile, so it is claimed
+                    // after it and hands hover back to the tile -- otherwise
+                    // pointing at the bar would stop the video playing.
+                    if let Some((bar, _, total)) = self.seek_bar(index, rect) {
+                        let bar_response = ui.interact(
+                            bar,
+                            ui.id().with(("seek", index)),
+                            Sense::click_and_drag(),
+                        );
+                        if bar_response.hovered() {
+                            hovering = true;
+                        }
+                        if let Some(pointer) = bar_response.interact_pointer_pos() {
+                            hovering = true;
+                            seek_request = Some((index, seek_position(bar, pointer.x, total)));
+                        }
+                    }
+
+                    if hovering {
+                        hovered_now = Some(index);
+                    }
+                    self.draw_tile(ui, index, rect, hovering);
+                }
+
+                let center = viewport.min.y + viewport.height() / 2.0;
+                let settled = self.settle.update(viewport.min.y, Instant::now());
+                self.hovered = hovered_now;
+                self.follow_sound();
+                self.retier_thumbnails();
+                self.request_visible_thumbnails();
+                self.request_missing_durations();
+                self.schedule_playback(&layout, center, settled);
+                self.trim_textures(&layout);
+                self.request_prefetch(&ctx, settled);
+            });
+            self.scroll_offset = output.state.offset.y;
         });
 
         // Re-sorting moves every tile, so it happens once the frame is drawn
@@ -985,9 +1481,39 @@ impl eframe::App for MandalaApp {
         if let Some((index, position)) = seek_request {
             self.player.seek(index, position);
         }
-        if let Some(index) = activated {
-            self.activate(index);
+        if let Some((index, new_tab)) = activated {
+            if new_tab && self.entries.get(index).is_some_and(Entry::is_dir) {
+                self.open_tab(self.entries[index].path.clone());
+            } else {
+                self.activate(index);
+            }
         }
+        if context_requested {
+            if mandala_core::archive::location(&self.current_dir).is_some() {
+                self.operation_error = Some(self.lang.text(Phrase::ZipPreviewOnly).to_owned());
+            } else {
+                match crate::shell::popup(frame, &self.selected_paths()) {
+                    Ok(Some(true)) => self.begin_rename(),
+                    Ok(Some(false)) => self.reload(),
+                    Ok(None) => {}
+                    Err(e) => self.operation_error = Some(e.to_string()),
+                }
+            }
+        }
+        self.rename_dialog(&ctx, frame);
+    }
+}
+
+/// Deferred jobs remain queued, but must be requestable at visible priority.
+fn release_request_marker(
+    job: Job,
+    requested: &mut HashSet<(PathBuf, u32)>,
+    durations: &mut HashSet<PathBuf>,
+) {
+    if let Some(tier) = job.tier() {
+        requested.remove(&(job.path().to_path_buf(), tier));
+    } else {
+        durations.remove(job.path());
     }
 }
 
@@ -1115,6 +1641,30 @@ fn draw_play_badge(painter: &egui::Painter, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_requests_release_only_their_own_visible_priority_markers() {
+        let path = PathBuf::from("pictures.zip");
+        let mut requested = HashSet::from([(path.clone(), 128), (path.clone(), 256)]);
+        let mut durations = HashSet::from([PathBuf::from("movie.mp4")]);
+        release_request_marker(
+            Job::Folder { path: path.clone(), tier: 128 },
+            &mut requested,
+            &mut durations,
+        );
+        assert!(
+            !requested.contains(&(path.clone(), 128)),
+            "a deferred tile must be promotable when visible again"
+        );
+        assert!(requested.contains(&(path, 256)), "another tier may still be in flight");
+        let video = PathBuf::from("movie.mp4");
+        release_request_marker(
+            Job::Duration { meta_key: mandala_core::CacheKey::metadata(&video, 0, 0), path: video },
+            &mut requested,
+            &mut durations,
+        );
+        assert!(durations.is_empty());
+    }
 
     #[test]
     fn fitting_preserves_aspect_ratio_within_the_bounds() {
@@ -1333,14 +1883,138 @@ mod tests {
     }
 
     #[test]
+    fn each_directory_restores_its_own_view() {
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), Path::new("A"));
+        settings.tile_px = 800.0;
+        settings.budget = 2;
+        settings.autoplay = false;
+        settings.show_labels = false;
+        settings.sound = true;
+        settings.sort = Sort { key: SortKey::Size, order: SortOrder::Descending };
+        settings.enter_directory(Path::new("A"), Path::new("B"));
+        settings.tile_px = 120.0;
+        settings.budget = 8;
+        settings.enter_directory(Path::new("B"), Path::new("A"));
+        assert_eq!(settings.tile_px, 800.0);
+        assert_eq!(settings.budget, 2);
+        assert!(!settings.autoplay);
+        assert!(!settings.show_labels);
+        assert!(settings.sound);
+        assert_eq!(settings.sort.key, SortKey::Size);
+        assert_eq!(settings.sort.order, SortOrder::Descending);
+    }
+
+    #[test]
+    fn unseen_directories_use_the_original_defaults_not_the_previous_view() {
+        let mut settings = Settings { tile_px: 400.0, budget: 3, ..Settings::default() };
+        settings.enter_directory(Path::new(""), Path::new("A"));
+        settings.tile_px = 1000.0;
+        settings.budget = 1;
+        settings.enter_directory(Path::new("A"), Path::new("B"));
+        assert_eq!(settings.tile_px, 400.0);
+        assert_eq!(settings.budget, 3);
+    }
+
+    #[test]
+    fn directory_views_survive_restart_including_the_current_directory() {
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), Path::new("A"));
+        settings.tile_px = 700.0;
+        settings.remember_directory(Path::new("A"));
+        let encoded = ron::to_string(&settings).unwrap();
+        let mut decoded: Settings = ron::from_str(&encoded).unwrap();
+        decoded.enter_directory(Path::new(""), Path::new("B"));
+        assert_eq!(decoded.tile_px, 260.0);
+        decoded.enter_directory(Path::new("B"), Path::new("A"));
+        assert_eq!(decoded.tile_px, 700.0);
+    }
+
+    #[test]
+    fn bookmarks_remain_shared_between_directories() {
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), Path::new("A"));
+        bookmarks::toggle(&mut settings.bookmarks, Path::new("saved"));
+        settings.enter_directory(Path::new("A"), Path::new("B"));
+        assert!(bookmarks::contains(&settings.bookmarks, Path::new("saved")));
+    }
+
+    #[test]
+    fn directory_settings_are_sanitized_when_loaded() {
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), Path::new("A"));
+        settings.tile_px = f32::NAN;
+        settings.budget = 0;
+        settings.remember_directory(Path::new("A"));
+        // Loaded profiles must be checked even if an old app or an editor
+        // wrote values beyond the current limits.
+        for view in settings.directories.values_mut() {
+            view.tile_px = f32::NAN;
+            view.budget = 0;
+        }
+        let mut settings = settings.sanitized();
+        settings.enter_directory(Path::new(""), Path::new("A"));
+        assert_eq!(settings.tile_px, Settings::default().tile_px);
+        assert_eq!(settings.budget, 1);
+    }
+
+    #[test]
+    fn alternate_spellings_of_a_real_directory_share_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), dir.path());
+        settings.tile_px = 600.0;
+        settings.enter_directory(dir.path(), Path::new("elsewhere"));
+        settings.enter_directory(Path::new("elsewhere"), &dir.path().join("."));
+        assert_eq!(settings.tile_px, 600.0);
+    }
+
+    #[test]
+    fn an_unavailable_directory_keeps_its_original_settings_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("photos");
+        std::fs::create_dir(&directory).unwrap();
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), &directory);
+        settings.tile_px = 900.0;
+        std::fs::remove_dir(&directory).unwrap();
+        settings.remember_directory(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        settings.enter_directory(Path::new(""), &directory);
+        assert_eq!(settings.tile_px, 900.0);
+    }
+
+    #[test]
+    fn zip_subfolders_have_independent_view_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("photos.zip");
+        // Key resolution only needs an archive's filesystem identity.
+        std::fs::write(&archive, b"").unwrap();
+        let first = archive.join("旅行");
+        let second = archive.join("家族");
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), &first);
+        settings.tile_px = 550.0;
+        settings.enter_directory(&first, &second);
+        assert_eq!(settings.tile_px, 260.0);
+        settings.enter_directory(&second, &first);
+        assert_eq!(settings.tile_px, 550.0);
+    }
+
+    #[test]
     fn a_settings_file_from_before_bookmarks_still_loads() {
         // Someone updating from 0.2.0 has one of these. A missing field must
         // read as "no bookmarks yet", not as a settings file the app throws
         // away along with everything else in it.
         let older = "(tile_px:300.0,autoplay:true,budget:8,show_labels:true,                     sort:(key:Name,order:Ascending))";
-        let decoded: Settings = ron::from_str(older).expect("an older file must still parse");
+        let mut decoded: Settings = ron::from_str(older).expect("an older file must still parse");
         assert!(decoded.bookmarks.is_empty());
         assert!(!decoded.sound, "and sound stays off until it is asked for");
+        assert_eq!(decoded.budget, 8);
+        decoded.enter_directory(Path::new(""), Path::new("first"));
+        decoded.tile_px = 900.0;
+        decoded.enter_directory(Path::new("first"), Path::new("new"));
+        assert_eq!(decoded.tile_px, 300.0, "new folders inherit the legacy view");
         assert_eq!(decoded.budget, 8);
     }
 
@@ -1354,6 +2028,7 @@ mod tests {
             sort: Sort { key: SortKey::Size, order: SortOrder::Descending },
             bookmarks: vec![PathBuf::from("photos"), PathBuf::from("clips")],
             sound: true,
+            ..Settings::default()
         };
         let encoded = ron::to_string(&settings).unwrap();
         let decoded: Settings = ron::from_str(&encoded).unwrap();
