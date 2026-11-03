@@ -460,11 +460,10 @@ impl ThumbnailService {
         for work in inner.background.values_mut() {
             work.prefetch_epoch = Some(epoch);
         }
-        for ((id, _), promoted) in &mut inner.active_background {
-            if !allowed.contains(&id.0) {
-                *promoted = false;
-            }
-        }
+        // A promoted in-flight request owns a visible-priority marker. Keep
+        // its completion foreground-tagged even if a filter hides its tile:
+        // the UI must receive it to release that marker, not discard it as an
+        // old-epoch prefetch. Navigation/reload reset both in clear_pending.
         drop(inner);
         self.queue.wake.notify_all();
         removed
@@ -774,6 +773,27 @@ fn cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_promoted_prefetch_stays_foreground_tagged_when_filtered_out() {
+        let service = test_service();
+        assert!(service.prefetch(thumbnail_job(1), 5));
+        let work = service.queue.inner.lock().unwrap().take_ready().unwrap();
+        service.request(thumbnail_job(1));
+        service.rebase_background(6, 128, &Default::default());
+        let finished = service.queue.finish(&work);
+        assert!(
+            finished.promoted,
+            "the UI still needs to release the hidden tile's request marker"
+        );
+        let done = JobDone {
+            path: work.job.path().to_path_buf(),
+            tier: work.job.tier(),
+            thumbnail: None,
+            duration: None,
+            prefetch_epoch: work.prefetch_epoch,
+        };
+        assert_eq!(finish_result(&work, done, finished.promoted).prefetch_epoch, None);
+    }
     #[test]
     fn filtering_prunes_pending_and_deferred_work_but_keeps_matching_fifo_work() {
         let service = test_service();
