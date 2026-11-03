@@ -4,6 +4,7 @@
 //! playback scheduling are the two places where this app lives or dies on
 //! performance, so they are kept as pure functions and pinned down by tests.
 
+pub mod archive;
 pub mod bookmarks;
 pub mod cache_key;
 pub mod filter;

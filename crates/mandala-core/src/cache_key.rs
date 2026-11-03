@@ -43,7 +43,15 @@ impl CacheKey {
     /// it wrong produces no error, just permanent cache misses or a stale
     /// thumbnail for a re-encoded file.
     pub fn for_entry(entry: &Entry, target_px: u32) -> Self {
-        Self::new(&entry.path, entry.mtime_unix_nanos(), entry.len, target_px)
+        let key = Self::new(&entry.path, entry.mtime_unix_nanos(), entry.len, target_px);
+        if let Some(tag) = entry.cache_tag {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(key.as_str().as_bytes());
+            hasher.update(&tag);
+            Self(hasher.finalize().to_hex()[..KEY_BYTES * 2].to_owned())
+        } else {
+            key
+        }
     }
 
     /// Key for a tile assembled from several files, such as a folder's mosaic.
@@ -63,6 +71,9 @@ impl CacheKey {
             hasher.update(&[0]);
             hasher.update(&part.mtime_unix_nanos().to_le_bytes());
             hasher.update(&part.len.to_le_bytes());
+            if let Some(tag) = part.cache_tag {
+                hasher.update(&tag);
+            }
         }
         hasher.update(&target_px.to_le_bytes());
         Self(hasher.finalize().to_hex()[..KEY_BYTES * 2].to_owned())
@@ -70,7 +81,7 @@ impl CacheKey {
 
     /// Size-independent key for a scanned entry.
     pub fn metadata_for(entry: &Entry) -> Self {
-        Self::metadata(&entry.path, entry.mtime_unix_nanos(), entry.len)
+        Self::for_entry(entry, 0)
     }
 
     pub fn as_str(&self) -> &str {
@@ -87,6 +98,17 @@ impl CacheKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archive_identity_changes_member_and_mosaic_keys_without_changing_display_size() {
+        let mut image = part("a.zip/photo.png", 5);
+        image.cache_tag = Some([1; 32]);
+        let before = CacheKey::for_entry(&image, 256);
+        let group = CacheKey::for_group(Path::new("a.zip"), &[image.clone()], 256);
+        image.cache_tag = Some([2; 32]);
+        assert_eq!(image.len, 5);
+        assert_ne!(before, CacheKey::for_entry(&image, 256));
+        assert_ne!(group, CacheKey::for_group(Path::new("a.zip"), &[image], 256));
+    }
 
     fn key(path: &str, mtime: i128, len: u64, px: u32) -> CacheKey {
         CacheKey::new(Path::new(path), mtime, len, px)
@@ -94,6 +116,7 @@ mod tests {
 
     fn part(name: &str, len: u64) -> Entry {
         Entry {
+            cache_tag: None,
             path: std::path::PathBuf::from(name),
             name: name.to_owned(),
             kind: crate::MediaKind::Image,
@@ -198,6 +221,7 @@ mod tests {
         // A whole second, because Windows timestamps land on 100ns boundaries
         // and a single nanosecond would be rounded away before it was read back.
         let entry = Entry {
+            cache_tag: None,
             path: std::path::PathBuf::from("a/b.mp4"),
             name: "b.mp4".into(),
             kind: MediaKind::Video,

@@ -9,7 +9,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use mandala_core::slots::SlotPlan;
 use mandala_media::backend::Advance;
 use mandala_media::{Frame, MediaBackend, VideoStream};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Frame rate for a tile that is merely on screen.
@@ -62,22 +64,63 @@ enum Command {
 }
 
 /// Spawns one worker thread, wired to its command channel and the shared sink.
-type SpawnSlot = Box<dyn Fn(usize, Receiver<Command>, Sender<SlotEvent>)>;
+type SpawnSlot = Box<dyn Fn(usize, Receiver<Command>, EventSink)>;
+
+/// One replaceable event per live worker, independent of UI drain frequency.
+#[derive(Default)]
+struct FrameMailbox {
+    slots: Mutex<BTreeMap<u64, Option<SlotEvent>>>,
+}
+
+impl FrameMailbox {
+    fn register(self: &Arc<Self>, id: u64) -> EventSink {
+        self.slots.lock().unwrap().insert(id, None);
+        EventSink { mailbox: Arc::clone(self), id }
+    }
+
+    fn unregister(&self, id: u64) {
+        self.slots.lock().unwrap().remove(&id);
+    }
+
+    fn drain(&self) -> Vec<SlotEvent> {
+        self.slots.lock().unwrap().values_mut().filter_map(Option::take).collect()
+    }
+}
+
+struct EventSink {
+    mailbox: Arc<FrameMailbox>,
+    id: u64,
+}
+
+impl EventSink {
+    fn connected(&self) -> bool {
+        self.mailbox.slots.lock().unwrap().contains_key(&self.id)
+    }
+
+    fn publish(&self, event: SlotEvent) -> bool {
+        let mut slots = self.mailbox.slots.lock().unwrap();
+        let Some(slot) = slots.get_mut(&self.id) else { return false };
+        let previous = slot.replace(event);
+        drop(slots);
+        drop(previous);
+        true
+    }
+}
 
 struct SlotHandle {
     commands: Sender<Command>,
     /// Tile this slot is playing, as far as the UI thread knows.
     holding: Option<usize>,
     fps: f32,
+    event_id: u64,
 }
 
 pub struct PlaybackService {
     slots: Vec<SlotHandle>,
     /// Mirrors `slots[i].holding`, so it can be handed out as a slice.
     holding: Vec<Option<usize>>,
-    events: Receiver<SlotEvent>,
-    /// Kept so resizing the pool can spawn more slots wired to the same sink.
-    event_sink: Sender<SlotEvent>,
+    events: Arc<FrameMailbox>,
+    next_event_id: u64,
     spawn: SpawnSlot,
 }
 
@@ -86,7 +129,7 @@ impl PlaybackService {
         backend: B,
         on_frame: impl Fn() + Send + Clone + 'static,
     ) -> Self {
-        let (event_sink, events) = unbounded();
+        let events = Arc::new(FrameMailbox::default());
         let spawn = Box::new(move |slot: usize, commands, sink| {
             let backend = backend.clone();
             let on_frame = on_frame.clone();
@@ -95,7 +138,7 @@ impl PlaybackService {
                 .spawn(move || run_slot(commands, sink, backend, on_frame))
                 .expect("spawning a playback worker");
         });
-        Self { slots: Vec::new(), holding: Vec::new(), events, event_sink, spawn }
+        Self { slots: Vec::new(), holding: Vec::new(), events, next_event_id: 0, spawn }
     }
 
     /// What each slot is playing, in slot order -- the input to slot planning.
@@ -119,12 +162,16 @@ impl PlaybackService {
     pub fn resize(&mut self, count: usize) {
         while self.slots.len() > count {
             // Dropping the sender ends the worker once it finishes its frame.
-            self.slots.pop();
+            if let Some(slot) = self.slots.pop() {
+                self.events.unregister(slot.event_id);
+            }
         }
         while self.slots.len() < count {
             let (commands, receiver) = unbounded();
-            (self.spawn)(self.slots.len(), receiver, self.event_sink.clone());
-            self.slots.push(SlotHandle { commands, holding: None, fps: AMBIENT_FPS });
+            let event_id = self.next_event_id;
+            self.next_event_id += 1;
+            (self.spawn)(self.slots.len(), receiver, self.events.register(event_id));
+            self.slots.push(SlotHandle { commands, holding: None, fps: AMBIENT_FPS, event_id });
         }
         self.holding.resize(self.slots.len(), None);
     }
@@ -192,12 +239,19 @@ impl PlaybackService {
         self.sync_holding();
     }
 
+    /// Disconnect producers before any other service waits on external I/O.
+    pub fn shutdown(&mut self) {
+        self.events.slots.lock().unwrap().clear();
+        self.slots.clear();
+        self.holding.clear();
+    }
+
     /// Takes whatever the workers have produced since the last call.
     ///
     /// Also frees any slot that reported its stream lost, so the scheduler can
     /// hand that tile to a fresh decoder on the next frame.
     pub fn drain(&mut self) -> Vec<SlotEvent> {
-        let events: Vec<SlotEvent> = self.events.try_iter().collect();
+        let events = self.events.drain();
         let lost = events.iter().any(|e| matches!(e, SlotEvent::Lost { .. }));
         for event in &events {
             if let SlotEvent::Lost { tile } = event
@@ -213,10 +267,11 @@ impl PlaybackService {
     }
 }
 
-// No Drop impl: dropping the slots drops every command sender, which is what
-// tells the workers to finish. An earlier version kept JoinHandles to wait on,
-// except the spawn closure discarded them, so it waited on an empty list and
-// read as an orderly shutdown that was not happening.
+impl Drop for PlaybackService {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
 
 struct Playing {
     stream: Box<dyn VideoStream>,
@@ -269,8 +324,8 @@ impl Playing {
 }
 
 /// Tells the UI a slot has gone quiet, and wakes it so it acts on that.
-fn report_lost(events: &Sender<SlotEvent>, on_frame: &impl Fn(), tile: usize) {
-    if events.send(SlotEvent::Lost { tile }).is_ok() {
+fn report_lost(events: &EventSink, on_frame: &impl Fn(), tile: usize) {
+    if events.publish(SlotEvent::Lost { tile }) {
         on_frame();
     }
 }
@@ -281,13 +336,16 @@ fn interval_for(fps: f32) -> Duration {
 
 fn run_slot(
     commands: Receiver<Command>,
-    events: Sender<SlotEvent>,
+    events: EventSink,
     backend: impl MediaBackend,
     on_frame: impl Fn(),
 ) {
     let mut playing: Option<Playing> = None;
 
     loop {
+        if !events.connected() {
+            return;
+        }
         // Idle slots block; playing slots wait only until their next frame is
         // due, so a reassignment lands within one frame interval either way.
         let command = match &playing {
@@ -358,7 +416,7 @@ fn run_slot(
                     duration: state.stream.duration(),
                     frame,
                 };
-                if events.send(SlotEvent::Frame(decoded)).is_err() {
+                if !events.publish(SlotEvent::Frame(decoded)) {
                     return;
                 }
                 on_frame();
@@ -385,6 +443,61 @@ fn run_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_frame(tile: usize, timestamp: u64) -> SlotEvent {
+        SlotEvent::Frame(DecodedFrame {
+            tile,
+            generation: 1,
+            duration: None,
+            frame: Frame {
+                width: 1,
+                height: 1,
+                rgba: vec![1, 2, 3, 255],
+                timestamp: Duration::from_millis(timestamp),
+            },
+        })
+    }
+
+    #[test]
+    fn a_paused_ui_retains_only_the_latest_frame_for_each_slot() {
+        let mailbox = Arc::new(FrameMailbox::default());
+        let first = mailbox.register(0);
+        let second = mailbox.register(1);
+        for i in 0..10_000 {
+            assert!(first.publish(test_frame(0, i)));
+        }
+        assert!(second.publish(test_frame(1, 7)));
+        let events = mailbox.drain();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|event| matches!(event, SlotEvent::Frame(frame)
+            if frame.tile == 0 && frame.frame.timestamp == Duration::from_millis(9_999))));
+    }
+
+    #[test]
+    fn unregistering_a_slot_disconnects_its_old_producer() {
+        let mailbox = Arc::new(FrameMailbox::default());
+        let old = mailbox.register(0);
+        mailbox.unregister(0);
+        let current = mailbox.register(1);
+        assert!(!old.connected());
+        assert!(!old.publish(test_frame(0, 99)));
+        assert!(current.publish(test_frame(1, 1)));
+        assert_eq!(mailbox.drain().len(), 1);
+    }
+
+    #[test]
+    fn shutdown_disconnects_every_slot_and_releases_pending_frames() {
+        let (mut player, _, _) = service();
+        player.resize(2);
+        let sink = EventSink { mailbox: Arc::clone(&player.events), id: player.slots[0].event_id };
+        assert!(sink.publish(test_frame(0, 1)));
+        player.shutdown();
+        assert_eq!(player.slot_count(), 0);
+        assert!(player.drain().is_empty());
+        assert!(!sink.connected());
+        assert!(!sink.publish(test_frame(0, 2)));
+        player.shutdown();
+    }
     use anyhow::Result;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};

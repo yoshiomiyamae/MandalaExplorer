@@ -1,10 +1,11 @@
 //! Background thumbnail and metadata production.
 //!
 //! Work happens off the UI thread, is cached on disk between runs, and is
-//! served newest-request-first: when someone flings the scrollbar, the tiles
-//! they are looking at now matter far more than the ones they flew past.
+//! prioritises the newest visible requests. Tiles scrolled past remain in a
+//! FIFO background queue, ready to resume or be promoted when visible again.
 
 use crate::cache::{CACHE_LIMIT_BYTES, mark_used, sweep};
+use crate::load::{BackgroundBudget, CpuMonitor};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use mandala_core::{
@@ -13,10 +14,10 @@ use mandala_core::{
 };
 use mandala_media::mosaic::mosaic;
 use mandala_media::{Frame, MediaBackend};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Sizes thumbnails are generated at.
 ///
@@ -45,9 +46,8 @@ pub enum Job {
     },
     /// A mosaic of what is inside a folder.
     ///
-    /// It carries no cache key, unlike the others: which files the tile is
-    /// built from is only known after reading the directory, and that read is
-    /// I/O that belongs on a worker rather than on the UI thread.
+    /// Ordinary folders need a listing before their cache key is known. ZIP
+    /// folders can use their archive metadata first. Both belong on workers.
     Folder { path: PathBuf, tier: u32 },
     /// Only the running time, for a video that is not on screen.
     ///
@@ -57,6 +57,21 @@ pub enum Job {
 }
 
 impl Job {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Thumbnail { path, .. }
+            | Self::Folder { path, .. }
+            | Self::Duration { path, .. } => path,
+        }
+    }
+
+    pub fn tier(&self) -> Option<u32> {
+        match self {
+            Self::Thumbnail { tier, .. } | Self::Folder { tier, .. } => Some(*tier),
+            Self::Duration { .. } => None,
+        }
+    }
+
     /// A thumbnail at a given tier.
     ///
     /// Both keys come from the tier here rather than from the caller: passing
@@ -92,49 +107,213 @@ pub struct JobDone {
     /// asking for a thumbnail that cannot be made.
     pub thumbnail: Option<Result<Frame>>,
     pub duration: Option<Duration>,
+    pub tier: Option<u32>,
+    /// Prefetched pixels stay on disk and never become off-screen GPU textures.
+    pub prefetch_epoch: Option<u64>,
 }
-
-/// Bounds the backlog. Anything older than this many requests is stale enough
-/// that the user has almost certainly scrolled past it.
-const MAX_PENDING: usize = 1024;
 
 struct Queue {
     inner: Mutex<QueueInner>,
     wake: Condvar,
 }
 
+#[derive(Default)]
 struct QueueInner {
     pending: VecDeque<Job>,
+    background: BTreeMap<u64, Work>,
+    background_ids: HashMap<RequestId, u64>,
+    next_background: u64,
+    active: usize,
+    active_background: HashMap<(RequestId, u64), bool>,
+    budget: BackgroundBudget,
+    maintenance: usize,
+    epoch: u64,
+    prefetched_since_sweep: usize,
     shutdown: bool,
+}
+
+#[derive(Debug)]
+struct Work {
+    job: Job,
+    prefetch_epoch: Option<u64>,
+}
+
+type RequestId = (PathBuf, Option<u32>);
+
+struct Finished {
+    promoted: bool,
+    sweep: bool,
+}
+
+fn same_request(left: &Job, right: &Job) -> bool {
+    left.path() == right.path() && left.tier() == right.tier()
+}
+
+impl QueueInner {
+    #[cfg(test)]
+    fn idle(&self) -> bool {
+        self.pending.is_empty()
+            && self.active == 0
+            && self.active_background.is_empty()
+            && self.background.is_empty()
+            && self.maintenance == 0
+    }
+    fn remove_background(&mut self, job: &Job) {
+        if let Some(sequence) = self.background_ids.remove(&(job.path().to_path_buf(), job.tier()))
+        {
+            self.background.remove(&sequence);
+        }
+    }
+
+    fn defer(&mut self, job: Job, epoch: u64) {
+        self.remove_background(&job);
+        let sequence = self.next_background;
+        self.next_background += 1;
+        self.background_ids.insert((job.path().to_path_buf(), job.tier()), sequence);
+        self.background.insert(sequence, Work { job, prefetch_epoch: Some(epoch) });
+    }
+
+    fn foreground_busy(&self) -> bool {
+        !self.pending.is_empty()
+            || self.active > 0
+            || self.active_background.values().any(|promoted| *promoted)
+    }
+
+    fn background_capacity(&self) -> usize {
+        if self.shutdown || self.foreground_busy() {
+            return 0;
+        }
+        self.budget
+            .limit()
+            .saturating_sub(self.maintenance + self.active_background.len() + self.background.len())
+    }
+
+    fn take_ready(&mut self) -> Option<Work> {
+        if let Some(job) = self.pending.pop_front() {
+            self.active += 1;
+            return Some(Work { job, prefetch_epoch: None });
+        }
+        if !self.foreground_busy()
+            && self.active_background.len() < self.budget.limit().saturating_sub(self.maintenance)
+            && let Some((_, work)) = self.background.pop_first()
+        {
+            self.background_ids.remove(&(work.job.path().to_path_buf(), work.job.tier()));
+            self.active_background.insert(
+                ((work.job.path().to_path_buf(), work.job.tier()), work.prefetch_epoch.unwrap()),
+                false,
+            );
+            return Some(work);
+        }
+        None
+    }
 }
 
 impl Queue {
     fn push(&self, job: Job) {
         let mut inner = self.inner.lock().unwrap();
+        inner.budget.pause();
+        let active_key = ((job.path().to_path_buf(), job.tier()), inner.epoch);
+        if let Some(promoted) = inner.active_background.get_mut(&active_key) {
+            // Keep the running decode, but deliver its pixels to the visible
+            // tile instead of starting the same work a second time.
+            *promoted = true;
+            return;
+        }
+        inner.remove_background(&job);
+        inner.pending.retain(|queued| !same_request(queued, &job));
         // Newest first: the tiles on screen right now are at the front.
         inner.pending.push_front(job);
-        inner.pending.truncate(MAX_PENDING);
         drop(inner);
         self.wake.notify_one();
     }
 
-    fn pop(&self) -> Option<Job> {
+    fn pop(&self) -> Option<Work> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if inner.shutdown {
                 return None;
             }
-            if let Some(job) = inner.pending.pop_front() {
-                return Some(job);
+            if let Some(work) = inner.take_ready() {
+                return Some(work);
             }
             inner = self.wake.wait(inner).unwrap();
         }
+    }
+
+    fn try_prefetch(&self, job: Job, epoch: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let id = (job.path().to_path_buf(), job.tier());
+        if inner.background_capacity() == 0
+            || inner.background_ids.contains_key(&id)
+            || inner.active_background.contains_key(&(id, epoch))
+        {
+            return false;
+        }
+        inner.epoch = epoch;
+        inner.defer(job, epoch);
+        drop(inner);
+        self.wake.notify_one();
+        true
+    }
+
+    fn defer_outside(
+        &self,
+        visible: &std::collections::HashSet<PathBuf>,
+        tier: u32,
+        epoch: u64,
+    ) -> Vec<Job> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.epoch = epoch;
+        let mut deferred = Vec::new();
+        let pending = std::mem::take(&mut inner.pending);
+        for job in pending {
+            let keep = job.tier().is_none_or(|t| t == tier && visible.contains(job.path()));
+            if keep {
+                inner.pending.push_back(job);
+            } else {
+                deferred.push(job.clone());
+                if job.tier() == Some(tier) {
+                    inner.defer(job, epoch);
+                }
+            }
+        }
+        drop(inner);
+        self.wake.notify_all();
+        deferred
+    }
+
+    fn finish(&self, work: &Work) -> Finished {
+        let mut inner = self.inner.lock().unwrap();
+        let (promoted, sweep) = if let Some(epoch) = work.prefetch_epoch {
+            let promoted = inner
+                .active_background
+                .remove(&((work.job.path().to_path_buf(), work.job.tier()), epoch))
+                .unwrap_or(false);
+            inner.prefetched_since_sweep += 1;
+            (promoted, inner.prefetched_since_sweep.is_multiple_of(32))
+        } else {
+            inner.active -= 1;
+            (false, false)
+        };
+        if sweep {
+            inner.maintenance += 1;
+        }
+        drop(inner);
+        self.wake.notify_all();
+        Finished { promoted, sweep }
+    }
+
+    fn finish_sweep(&self) {
+        self.inner.lock().unwrap().maintenance -= 1;
+        self.wake.notify_all();
     }
 
     fn shutdown(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.shutdown = true;
         inner.pending.clear();
+        inner.background.clear();
+        inner.background_ids.clear();
         drop(inner);
         self.wake.notify_all();
     }
@@ -144,6 +323,7 @@ pub struct ThumbnailService {
     queue: Arc<Queue>,
     results: Receiver<JobDone>,
     workers: Vec<std::thread::JoinHandle<()>>,
+    cpu: CpuMonitor,
 }
 
 impl ThumbnailService {
@@ -151,8 +331,13 @@ impl ThumbnailService {
         backend: B,
         on_ready: impl Fn() + Send + Clone + 'static,
     ) -> Self {
+        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let worker_count = parallelism.saturating_sub(2).clamp(2, 8);
         let queue = Arc::new(Queue {
-            inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
+            inner: Mutex::new(QueueInner {
+                budget: BackgroundBudget::for_workers(worker_count),
+                ..Default::default()
+            }),
             wake: Condvar::new(),
         });
         let (tx, results) = unbounded();
@@ -178,9 +363,6 @@ impl ThumbnailService {
         // Decoding a video poster frame is heavy, so a couple of threads short
         // of the core count keeps the UI thread responsive while a folder of
         // videos is being indexed.
-        let parallelism = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let worker_count = parallelism.saturating_sub(2).clamp(2, 8);
-
         let workers = (0..worker_count)
             .map(|_| {
                 let queue = Arc::clone(&queue);
@@ -191,9 +373,18 @@ impl ThumbnailService {
                 std::thread::Builder::new()
                     .name("mandala-thumbs".into())
                     .spawn(move || {
-                        while let Some(job) = queue.pop() {
-                            let done = run(&job, &cache_dir, &backend);
-                            if tx.send(done).is_err() {
+                        while let Some(work) = queue.pop() {
+                            let done = run(&work.job, &cache_dir, &backend);
+                            let finished = queue.finish(&work);
+                            let done = finish_result(&work, done, finished.promoted);
+                            let sent = tx.send(done);
+                            if finished.sweep {
+                                if sent.is_ok() {
+                                    let _ = sweep(&cache_dir, CACHE_LIMIT_BYTES);
+                                }
+                                queue.finish_sweep();
+                            }
+                            if sent.is_err() {
                                 break;
                             }
                             on_ready();
@@ -203,13 +394,108 @@ impl ThumbnailService {
             })
             .collect();
 
-        Self { queue, results, workers }
+        Self { queue, results, workers, cpu: CpuMonitor::default() }
     }
 
-    /// Queues work. Callers are expected to track what they have already asked
-    /// for; this does not deduplicate.
+    /// Repeated requests promote existing work rather than enqueueing copies.
     pub fn request(&self, job: Job) {
         self.queue.push(job);
+    }
+
+    pub fn prefetch_capacity(&self) -> usize {
+        self.queue.inner.lock().unwrap().background_capacity()
+    }
+
+    pub fn update_load(&mut self, now: Instant) {
+        if let Some(load) = self.cpu.poll(now) {
+            let mut inner = self.queue.inner.lock().unwrap();
+            let foreground = inner.foreground_busy();
+            inner.budget.observe(load, foreground);
+            drop(inner);
+            self.queue.wake.notify_all();
+        }
+    }
+
+    pub fn has_work(&self) -> bool {
+        let inner = self.queue.inner.lock().unwrap();
+        !inner.pending.is_empty()
+            || inner.active > 0
+            || !inner.background.is_empty()
+            || !inner.active_background.is_empty()
+            || inner.maintenance > 0
+    }
+
+    pub fn prefetch(&self, job: Job, epoch: u64) -> bool {
+        self.queue.try_prefetch(job, epoch)
+    }
+
+    pub fn rebase_background(
+        &self,
+        epoch: u64,
+        tier: u32,
+        allowed: &std::collections::HashSet<PathBuf>,
+    ) -> Vec<Job> {
+        let mut inner = self.queue.inner.lock().unwrap();
+        inner.epoch = epoch;
+        let mut removed = Vec::new();
+        inner.pending.retain(|job| {
+            let keep = allowed.contains(job.path()) && job.tier().is_none_or(|t| t == tier);
+            if !keep {
+                removed.push(job.clone());
+            }
+            keep
+        });
+        let obsolete: Vec<_> = inner
+            .background
+            .iter()
+            .filter(|(_, work)| work.job.tier() != Some(tier) || !allowed.contains(work.job.path()))
+            .map(|(sequence, _)| *sequence)
+            .collect();
+        for sequence in obsolete {
+            if let Some(work) = inner.background.remove(&sequence) {
+                inner.background_ids.remove(&(work.job.path().to_path_buf(), work.job.tier()));
+                removed.push(work.job);
+            }
+        }
+        for work in inner.background.values_mut() {
+            work.prefetch_epoch = Some(epoch);
+        }
+        // A promoted in-flight request owns a visible-priority marker. Keep
+        // its completion foreground-tagged even if a filter hides its tile:
+        // the UI must receive it to release that marker, not discard it as an
+        // old-epoch prefetch. Navigation/reload reset both in clear_pending.
+        drop(inner);
+        self.queue.wake.notify_all();
+        removed
+    }
+
+    pub fn defer_outside(
+        &self,
+        visible: &std::collections::HashSet<PathBuf>,
+        tier: u32,
+        epoch: u64,
+    ) -> Vec<Job> {
+        self.queue.defer_outside(visible, tier, epoch)
+    }
+
+    /// Called when all request records are reset on navigation or reload.
+    pub fn clear_pending(&self) {
+        let mut inner = self.queue.inner.lock().unwrap();
+        inner.pending.clear();
+        inner.background.clear();
+        inner.background_ids.clear();
+        inner.epoch = inner.epoch.wrapping_add(1);
+        for promoted in inner.active_background.values_mut() {
+            *promoted = false;
+        }
+    }
+
+    /// Signal cancellation and disconnect results without waiting on an OS
+    /// decoder or a network filesystem. Running work exits at its next boundary.
+    pub fn shutdown(&mut self) {
+        self.queue.shutdown();
+        self.results = unbounded().1;
+        self.workers.clear();
     }
 
     /// Takes whatever finished since the last call.
@@ -220,11 +506,16 @@ impl ThumbnailService {
 
 impl Drop for ThumbnailService {
     fn drop(&mut self) {
-        self.queue.shutdown();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
+        self.shutdown();
     }
+}
+
+fn finish_result(work: &Work, mut done: JobDone, promoted: bool) -> JobDone {
+    done.prefetch_epoch = if promoted { None } else { work.prefetch_epoch };
+    if done.prefetch_epoch.is_some() {
+        done.thumbnail = None;
+    }
+    done
 }
 
 fn run(job: &Job, cache_dir: &Path, backend: &impl MediaBackend) -> JobDone {
@@ -237,31 +528,76 @@ fn run(job: &Job, cache_dir: &Path, backend: &impl MediaBackend) -> JobDone {
                 }
                 probed
             });
-            JobDone { path: path.clone(), thumbnail: None, duration }
+            JobDone {
+                path: path.clone(),
+                thumbnail: None,
+                duration,
+                tier: None,
+                prefetch_epoch: None,
+            }
         }
         Job::Thumbnail { path, kind, key, meta_key, tier } => {
             let (thumbnail, duration) =
                 produce(path, *kind, key, meta_key, *tier, cache_dir, backend);
-            JobDone { path: path.clone(), thumbnail: Some(thumbnail), duration }
+            JobDone {
+                path: path.clone(),
+                thumbnail: Some(thumbnail),
+                duration,
+                tier: Some(*tier),
+                prefetch_epoch: None,
+            }
         }
         Job::Folder { path, tier } => JobDone {
             path: path.clone(),
             thumbnail: Some(produce_folder(path, *tier, cache_dir, backend)),
             duration: None,
+            tier: Some(*tier),
+            prefetch_epoch: None,
         },
     }
 }
 
-/// Builds a folder's tile out of the first few pictures inside it.
-///
-/// Reading directories happens here rather than on the UI thread, and only for
-/// folders actually on screen: a listing of ten thousand folders would
-/// otherwise be ten thousand directory reads before the first tile appeared.
+/// ZIP contents change with the archive, so its metadata can identify a cover
+/// before reading its index. Ordinary directories still need the member keys.
+fn archive_cover_cache_path(dir: &Path, tier: u32, cache_dir: &Path) -> Option<PathBuf> {
+    let (archive, _) = mandala_core::archive::location(dir)?;
+    let metadata = archive.metadata().ok()?;
+    let modified = metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let key = CacheKey::new(dir, modified.as_nanos() as i128, metadata.len(), tier);
+    Some(cache_dir.join(key.relative_path("zip-cover-v1.jpg")))
+}
+
 fn produce_folder(
     dir: &Path,
     tier: u32,
     cache_dir: &Path,
     backend: &impl MediaBackend,
+) -> Result<Frame> {
+    let quick_cache = archive_cover_cache_path(dir, tier, cache_dir);
+    if let Some(path) = &quick_cache
+        && let Ok(frame) = load_cached(path)
+    {
+        return Ok(frame);
+    }
+    let tile = produce_folder_mosaic(dir, tier, cache_dir, backend, quick_cache.is_none())?;
+    // Do not publish a cover under an old identity if the ZIP changed while
+    // its pictures were being decoded.
+    if let Some(path) = quick_cache
+        && archive_cover_cache_path(dir, tier, cache_dir).as_ref() == Some(&path)
+    {
+        let _ = store_cached(&path, &tile);
+    }
+    Ok(tile)
+}
+
+/// Builds a folder's tile out of the first few pictures inside it.
+/// Directory reads and image decoding happen only on thumbnail workers.
+fn produce_folder_mosaic(
+    dir: &Path,
+    tier: u32,
+    cache_dir: &Path,
+    backend: &impl MediaBackend,
+    cache_group: bool,
 ) -> Result<Frame> {
     let by_name = Sort { key: SortKey::Name, order: SortOrder::Ascending };
     let listing = |path: &Path| {
@@ -317,7 +653,11 @@ fn produce_folder(
     }
 
     let tile = mosaic(&frames, tier)?;
-    let _ = store_cached(&cached, &tile);
+    // ZIP covers are stored by the caller under the archive fingerprint.
+    // Still read old group entries above, so existing caches migrate lazily.
+    if cache_group {
+        let _ = store_cached(&cached, &tile);
+    }
     Ok(tile)
 }
 
@@ -433,6 +773,387 @@ fn cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_promoted_prefetch_stays_foreground_tagged_when_filtered_out() {
+        let service = test_service();
+        assert!(service.prefetch(thumbnail_job(1), 5));
+        let work = service.queue.inner.lock().unwrap().take_ready().unwrap();
+        service.request(thumbnail_job(1));
+        service.rebase_background(6, 128, &Default::default());
+        let finished = service.queue.finish(&work);
+        assert!(
+            finished.promoted,
+            "the UI still needs to release the hidden tile's request marker"
+        );
+        let done = JobDone {
+            path: work.job.path().to_path_buf(),
+            tier: work.job.tier(),
+            thumbnail: None,
+            duration: None,
+            prefetch_epoch: work.prefetch_epoch,
+        };
+        assert_eq!(finish_result(&work, done, finished.promoted).prefetch_epoch, None);
+    }
+    #[test]
+    fn filtering_prunes_pending_and_deferred_work_but_keeps_matching_fifo_work() {
+        let service = test_service();
+        service.request(thumbnail_job(1));
+        service.request(thumbnail_job(2));
+        service.defer_outside(&Default::default(), 128, 5);
+        service.request(thumbnail_job(3));
+        let allowed = [PathBuf::from("a1")].into_iter().collect();
+        let dropped = service.rebase_background(6, 128, &allowed);
+        assert_eq!(dropped.len(), 2);
+        service.defer_outside(&Default::default(), 128, 6);
+        let inner = service.queue.inner.lock().unwrap();
+        assert!(inner.pending.is_empty());
+        assert_eq!(inner.background.len(), 1);
+        assert_eq!(inner.background.first_key_value().unwrap().1.job.path(), Path::new("a1"));
+    }
+
+    fn resume_background(queue: &Queue) {
+        queue.inner.lock().unwrap().budget.observe(None, false);
+    }
+
+    fn parallel_queue() -> Queue {
+        let mut inner =
+            QueueInner { budget: BackgroundBudget::for_workers(4), ..Default::default() };
+        inner.budget.observe(Some(0.1), false);
+        inner.budget.observe(Some(0.1), false);
+        Queue { inner: Mutex::new(inner), wake: Condvar::new() }
+    }
+
+    #[test]
+    fn spare_capacity_admits_multiple_prefetches_and_promotes_the_correct_running_job() {
+        let queue = parallel_queue();
+        for seed in 1..=3 {
+            assert!(queue.try_prefetch(thumbnail_job(seed), 5));
+        }
+        assert!(!queue.try_prefetch(thumbnail_job(4), 5));
+        let first = queue.inner.lock().unwrap().take_ready().unwrap();
+        let second = queue.inner.lock().unwrap().take_ready().unwrap();
+        let third = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(queue.inner.lock().unwrap().active_background.len(), 3);
+        queue.push(thumbnail_job(2));
+        assert_eq!(queue.inner.lock().unwrap().background_capacity(), 0);
+        assert!(!queue.finish(&third).promoted);
+        assert!(!queue.finish(&first).promoted);
+        assert!(queue.finish(&second).promoted);
+    }
+
+    #[test]
+    fn shrinking_the_budget_waits_for_running_jobs_and_keeps_queued_work() {
+        let queue = parallel_queue();
+        for seed in 1..=3 {
+            assert!(queue.try_prefetch(thumbnail_job(seed), 5));
+        }
+        let mut running = Vec::new();
+        for _ in 0..3 {
+            running.push(queue.inner.lock().unwrap().take_ready().unwrap());
+        }
+        {
+            let mut inner = queue.inner.lock().unwrap();
+            inner.defer(thumbnail_job(4), 5);
+            inner.budget.observe(Some(0.95), false);
+            assert!(inner.take_ready().is_none());
+        }
+        for work in &running[..2] {
+            queue.finish(work);
+            assert!(queue.inner.lock().unwrap().take_ready().is_none());
+        }
+        queue.finish(&running[2]);
+        let next = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(next.job.path(), Path::new("a4"));
+    }
+
+    #[test]
+    fn foreground_work_can_start_while_background_slots_are_full() {
+        let queue = parallel_queue();
+        for seed in 1..=3 {
+            assert!(queue.try_prefetch(thumbnail_job(seed), 5));
+            queue.inner.lock().unwrap().take_ready().unwrap();
+        }
+        queue.push(thumbnail_job(4));
+        let visible = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(visible.prefetch_epoch, None);
+        assert_eq!(visible.job.path(), Path::new("a4"));
+        assert_eq!(queue.inner.lock().unwrap().background_capacity(), 0);
+    }
+
+    #[test]
+    fn cache_cleanup_also_leaves_a_worker_available_for_visible_requests() {
+        let queue = parallel_queue();
+        for seed in 0..32 {
+            assert!(queue.try_prefetch(thumbnail_job(seed), 5));
+            let work = queue.inner.lock().unwrap().take_ready().unwrap();
+            assert_eq!(queue.finish(&work).sweep, seed == 31);
+        }
+        assert_eq!(queue.inner.lock().unwrap().background_capacity(), 2);
+        queue.finish_sweep();
+        assert_eq!(queue.inner.lock().unwrap().background_capacity(), 3);
+    }
+
+    #[test]
+    fn a_large_queue_keeps_every_unique_request() {
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
+        for i in 0..1200 {
+            queue.push(thumbnail_job(i));
+        }
+        assert_eq!(queue.inner.lock().unwrap().pending.len(), 1200);
+        let mut completed = 0;
+        loop {
+            let work = queue.inner.lock().unwrap().take_ready();
+            let Some(work) = work else { break };
+            completed += 1;
+            queue.finish(&work);
+        }
+        assert_eq!(completed, 1200);
+    }
+
+    #[test]
+    fn foreground_work_pauses_background_admission_until_the_next_load_sample() {
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
+        assert!(queue.try_prefetch(thumbnail_job(0), 5));
+        queue.push(thumbnail_job(1));
+        let foreground = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(foreground.prefetch_epoch, None);
+        assert!(queue.inner.lock().unwrap().take_ready().is_none());
+        queue.finish(&foreground);
+        assert!(queue.inner.lock().unwrap().take_ready().is_none());
+        resume_background(&queue);
+        let background = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(background.prefetch_epoch, Some(5));
+        assert!(!queue.try_prefetch(thumbnail_job(2), 5));
+        queue.push(thumbnail_job(3));
+        let foreground = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(foreground.prefetch_epoch, None);
+        queue.finish(&foreground);
+        queue.finish(&background);
+        resume_background(&queue);
+        assert!(queue.try_prefetch(thumbnail_job(4), 5));
+    }
+
+    #[test]
+    fn scrolling_defers_offscreen_requests_without_discarding_them() {
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
+        queue.push(thumbnail_job(1));
+        queue.push(thumbnail_job(2));
+        let visible = std::collections::HashSet::from([PathBuf::from("a2")]);
+        let deferred = queue.defer_outside(&visible, 128, 5);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].path(), Path::new("a1"));
+        let foreground = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(foreground.job.path(), Path::new("a2"));
+        queue.finish(&foreground);
+        resume_background(&queue);
+        let background = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(background.job.path(), Path::new("a1"));
+        assert_eq!(background.prefetch_epoch, Some(5));
+    }
+
+    #[test]
+    fn a_visible_request_promotes_a_queued_prefetch_instead_of_duplicating_it() {
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
+        assert!(queue.try_prefetch(thumbnail_job(1), 5));
+        queue.push(thumbnail_job(1));
+        assert!(queue.inner.lock().unwrap().background.is_empty());
+        assert!(queue.inner.lock().unwrap().background_ids.is_empty());
+        let foreground = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(foreground.prefetch_epoch, None);
+        queue.finish(&foreground);
+        assert!(queue.inner.lock().unwrap().idle());
+    }
+
+    #[test]
+    fn prefetch_writes_the_cache_without_sending_pixels_to_the_ui() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("pictures.zip");
+        let cache = temp.path().join("cache");
+        write_zip_picture(&archive, [240, 10, 10, 255]);
+        let backend = mandala_media::default_backend().unwrap();
+        let work =
+            Work { job: Job::Folder { path: archive.clone(), tier: 128 }, prefetch_epoch: Some(7) };
+        let done = finish_result(&work, run(&work.job, &cache, &backend), false);
+        assert_eq!(done.prefetch_epoch, Some(7));
+        assert!(done.thumbnail.is_none());
+        assert!(archive_cover_cache_path(&archive, 128, &cache).unwrap().exists());
+        let visible = Work { job: work.job.clone(), prefetch_epoch: None };
+        assert!(
+            finish_result(&visible, run(&visible.job, &cache, &backend), false)
+                .thumbnail
+                .unwrap()
+                .is_ok()
+        );
+        let promoted = finish_result(&work, run(&work.job, &cache, &backend), true);
+        assert_eq!(promoted.prefetch_epoch, None);
+        assert!(promoted.thumbnail.unwrap().is_ok());
+    }
+
+    fn cached_archive_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("pictures.zip");
+        // A valid cached cover must not need to parse the archive at all.
+        std::fs::write(&archive, b"not a readable ZIP").unwrap();
+        let cache = temp.path().join("cache");
+        (temp, archive, cache)
+    }
+
+    fn seed_archive_cover(dir: &Path, tier: u32, cache: &Path) {
+        let path = archive_cover_cache_path(dir, tier, cache).unwrap();
+        let frame = Frame {
+            width: tier,
+            height: tier,
+            rgba: [220, 30, 10, 255].repeat((tier * tier) as usize),
+            timestamp: Duration::ZERO,
+        };
+        store_cached(&path, &frame).unwrap();
+    }
+
+    #[test]
+    fn cached_zip_covers_do_not_parse_or_extract_the_archive() {
+        let (_temp, archive, cache) = cached_archive_fixture();
+        seed_archive_cover(&archive, 128, &cache);
+        let backend = mandala_media::default_backend().unwrap();
+        let frame = produce_folder(&archive, 128, &cache, &backend).unwrap();
+        assert_eq!((frame.width, frame.height), (128, 128));
+        assert!(frame.rgba[0] > 200);
+    }
+
+    #[test]
+    fn cached_zip_subfolder_covers_skip_archive_scanning_too() {
+        let (_temp, archive, cache) = cached_archive_fixture();
+        let folder = archive.join("旅行");
+        seed_archive_cover(&folder, 128, &cache);
+        let backend = mandala_media::default_backend().unwrap();
+        assert!(produce_folder(&folder, 128, &cache, &backend).is_ok());
+        assert!(produce_folder(&archive.join("家族"), 128, &cache, &backend).is_err());
+    }
+
+    #[test]
+    fn zip_cover_cache_tracks_archive_size_timestamp_and_tier() {
+        let (_temp, archive, cache) = cached_archive_fixture();
+        seed_archive_cover(&archive, 128, &cache);
+        let backend = mandala_media::default_backend().unwrap();
+        assert!(produce_folder(&archive, 256, &cache, &backend).is_err());
+        let original = std::fs::metadata(&archive).unwrap().modified().unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&archive).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original + Duration::from_secs(2)))
+            .unwrap();
+        assert!(produce_folder(&archive, 128, &cache, &backend).is_err());
+        file.set_len(100).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original)).unwrap();
+        assert!(produce_folder(&archive, 128, &cache, &backend).is_err());
+    }
+
+    fn write_zip_picture(path: &Path, colour: [u8; 4]) {
+        use std::io::{Cursor, Write};
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba(colour)))
+            .write_to(&mut bytes, image::ImageFormat::Bmp)
+            .unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        zip.start_file(
+            "picture.bmp",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        zip.write_all(bytes.get_ref()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn generated_zip_covers_are_cached_before_the_next_archive_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("pictures.zip");
+        let cache = temp.path().join("cache");
+        write_zip_picture(&archive, [240, 10, 10, 255]);
+        let backend = mandala_media::default_backend().unwrap();
+        produce_folder(&archive, 128, &cache, &backend).unwrap();
+        let cached = archive_cover_cache_path(&archive, 128, &cache).unwrap();
+        assert!(cached.exists());
+        let metadata = archive.metadata().unwrap();
+        // Preserve the fingerprint but make parsing impossible, to prove the
+        // next request does not read the index or extract a source image.
+        std::fs::write(&archive, vec![0; metadata.len() as usize]).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        let cached_frame = produce_folder(&archive, 128, &cache, &backend).unwrap();
+        assert!(cached_frame.rgba[0] > 200);
+        // A broken cover can now be repaired from the cached ZIP index and
+        // member thumbnail, without rereading the corrupt archive payload.
+        std::fs::write(cached, b"broken JPEG").unwrap();
+        assert!(produce_folder(&archive, 128, &cache, &backend).unwrap().rgba[0] > 200);
+        // A new fingerprint must invalidate that index and fail on corruption.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(metadata.modified().unwrap() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert!(produce_folder(&archive, 128, &cache, &backend).is_err());
+    }
+
+    #[test]
+    fn changing_a_zip_regenerates_its_cover_even_at_the_same_file_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("pictures.zip");
+        let cache = temp.path().join("cache");
+        write_zip_picture(&archive, [240, 10, 10, 255]);
+        let old = archive.metadata().unwrap();
+        let backend = mandala_media::default_backend().unwrap();
+        let red = produce_folder(&archive, 128, &cache, &backend).unwrap();
+        assert!(red.rgba[0] > 200 && red.rgba[2] < 30);
+        write_zip_picture(&archive, [10, 10, 240, 255]);
+        assert_eq!(old.len(), archive.metadata().unwrap().len());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(old.modified().unwrap() + Duration::from_secs(2)),
+            )
+            .unwrap();
+        let blue = produce_folder(&archive, 128, &cache, &backend).unwrap();
+        assert!(blue.rgba[2] > 200 && blue.rgba[0] < 30);
+        let larger = produce_folder(&archive, 256, &cache, &backend).unwrap();
+        assert_eq!((larger.width, larger.height), (256, 256));
+    }
+
+    #[test]
+    fn ordinary_folder_covers_still_notice_changes_inside_existing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("pictures");
+        std::fs::create_dir(&folder).unwrap();
+        let picture = folder.join("picture.bmp");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([240, 10, 10, 255])).save(&picture).unwrap();
+        let folder_time = folder.metadata().unwrap().modified().unwrap();
+        let picture_time = picture.metadata().unwrap().modified().unwrap();
+        let cache = temp.path().join("cache");
+        let backend = mandala_media::default_backend().unwrap();
+        let red = produce_folder(&folder, 128, &cache, &backend).unwrap();
+        assert!(red.rgba[0] > 200 && red.rgba[2] < 30);
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 10, 240, 255])).save(&picture).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&picture)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(picture_time + Duration::from_secs(2)),
+            )
+            .unwrap();
+        assert_eq!(folder_time, folder.metadata().unwrap().modified().unwrap());
+        let blue = produce_folder(&folder, 128, &cache, &backend).unwrap();
+        assert!(blue.rgba[2] > 200 && blue.rgba[0] < 30);
+    }
 
     fn key(seed: i128) -> CacheKey {
         CacheKey::new(Path::new("a"), seed, 0, 128)
@@ -440,7 +1161,7 @@ mod tests {
 
     fn thumbnail_job(seed: i128) -> Job {
         Job::Thumbnail {
-            path: PathBuf::from("a"),
+            path: PathBuf::from(format!("a{seed}")),
             kind: MediaKind::Image,
             key: key(seed),
             meta_key: CacheKey::metadata(Path::new("a"), seed, 0),
@@ -550,38 +1271,129 @@ mod tests {
 
     #[test]
     fn the_queue_serves_the_newest_request_first() {
-        let queue = Queue {
-            inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
-            wake: Condvar::new(),
-        };
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
         for i in 0..3i128 {
             queue.push(thumbnail_job(i));
         }
         // The last one pushed is the one on screen now.
-        match queue.pop().unwrap() {
+        match queue.pop().unwrap().job {
             Job::Thumbnail { key: got, .. } => assert_eq!(got, key(2)),
             other => panic!("expected a thumbnail job, got {other:?}"),
         }
     }
 
     #[test]
-    fn the_queue_drops_the_oldest_requests_when_it_overflows() {
-        let queue = Queue {
-            inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
-            wake: Condvar::new(),
-        };
-        for i in 0..(MAX_PENDING as i128 + 10) {
-            queue.push(thumbnail_job(i));
+    fn repeated_requests_reorder_a_single_job_without_growing_the_queue() {
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
+        for _ in 0..1200 {
+            queue.push(thumbnail_job(1));
         }
-        assert_eq!(queue.inner.lock().unwrap().pending.len(), MAX_PENDING);
+        assert_eq!(queue.inner.lock().unwrap().pending.len(), 1);
+    }
+
+    #[test]
+    fn a_visible_request_reuses_an_already_running_background_decode() {
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
+        assert!(queue.try_prefetch(thumbnail_job(1), 5));
+        let work = queue.inner.lock().unwrap().take_ready().unwrap();
+        assert_eq!(work.prefetch_epoch, Some(5));
+        queue.push(thumbnail_job(1));
+        assert!(queue.inner.lock().unwrap().pending.is_empty());
+        assert!(queue.finish(&work).promoted);
+        assert!(queue.inner.lock().unwrap().idle());
+    }
+
+    #[test]
+    fn repeated_scrolls_keep_deferred_work_in_fifo_order() {
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
+        queue.push(thumbnail_job(1));
+        queue.defer_outside(&Default::default(), 128, 5);
+        queue.push(thumbnail_job(2));
+        queue.defer_outside(&Default::default(), 128, 5);
+        queue.push(thumbnail_job(3));
+        queue.defer_outside(&Default::default(), 128, 5);
+        resume_background(&queue);
+        for name in ["a1", "a2", "a3"] {
+            let work = queue.inner.lock().unwrap().take_ready().unwrap();
+            assert_eq!(work.job.path(), Path::new(name));
+            assert!(work.prefetch_epoch.is_some());
+            queue.finish(&work);
+        }
+        assert!(queue.inner.lock().unwrap().idle());
+        assert!(queue.inner.lock().unwrap().background_ids.is_empty());
+    }
+
+    fn test_service() -> ThumbnailService {
+        ThumbnailService {
+            queue: Arc::new(Queue {
+                inner: Mutex::new(QueueInner::default()),
+                wake: Condvar::new(),
+            }),
+            results: unbounded().1,
+            workers: Vec::new(),
+            cpu: CpuMonitor::default(),
+        }
+    }
+
+    #[test]
+    fn dropping_the_thumbnail_service_does_not_wait_for_blocked_external_io() {
+        let mut service = test_service();
+        let (release, blocked) = crossbeam_channel::bounded::<()>(1);
+        service.workers.push(std::thread::spawn(move || {
+            let _ = blocked.recv();
+        }));
+        let (finished, done) = crossbeam_channel::bounded(1);
+        let owner = std::thread::spawn(move || {
+            drop(service);
+            let _ = finished.send(());
+        });
+        let returned = done.recv_timeout(Duration::from_secs(2)).is_ok();
+        // Always release the fake I/O, including when testing a broken Drop.
+        let _ = release.send(());
+        owner.join().unwrap();
+        assert!(returned, "closing the app must not wait for a media/network read");
+    }
+
+    #[test]
+    fn resorting_keeps_deferred_work_but_changing_tier_cancels_obsolete_sizes() {
+        let service = test_service();
+        service.request(thumbnail_job(1));
+        service.defer_outside(&Default::default(), 128, 5);
+        service.rebase_background(6, 128, &[PathBuf::from("a1")].into_iter().collect());
+        assert_eq!(service.queue.inner.lock().unwrap().background.len(), 1);
+        assert_eq!(
+            service
+                .queue
+                .inner
+                .lock()
+                .unwrap()
+                .background
+                .first_key_value()
+                .unwrap()
+                .1
+                .prefetch_epoch,
+            Some(6)
+        );
+        service.rebase_background(7, 256, &[PathBuf::from("a1")].into_iter().collect());
+        assert!(service.queue.inner.lock().unwrap().background.is_empty());
+        assert!(service.queue.inner.lock().unwrap().background_ids.is_empty());
+    }
+
+    #[test]
+    fn a_reload_does_not_reuse_a_decode_from_the_old_context() {
+        let service = test_service();
+        assert!(service.prefetch(thumbnail_job(1), 5));
+        let work = service.queue.inner.lock().unwrap().take_ready().unwrap();
+        service.clear_pending();
+        service.rebase_background(6, 128, &[PathBuf::from("a1")].into_iter().collect());
+        service.request(thumbnail_job(1));
+        assert_eq!(service.queue.inner.lock().unwrap().pending.len(), 1);
+        assert!(!service.queue.finish(&work).promoted);
     }
 
     #[test]
     fn a_shut_down_queue_stops_handing_out_work() {
-        let queue = Queue {
-            inner: Mutex::new(QueueInner { pending: VecDeque::new(), shutdown: false }),
-            wake: Condvar::new(),
-        };
+        let queue = Queue { inner: Mutex::new(QueueInner::default()), wake: Condvar::new() };
         queue.push(thumbnail_job(0));
         queue.shutdown();
         assert!(queue.pop().is_none());

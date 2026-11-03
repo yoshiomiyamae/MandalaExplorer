@@ -11,6 +11,8 @@ use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// Source identity independent of the displayed size and modification time.
+    pub cache_tag: Option<[u8; 32]>,
     pub path: PathBuf,
     pub name: String,
     pub kind: MediaKind,
@@ -43,13 +45,21 @@ impl Entry {
 /// Unreadable children are skipped rather than failing the whole scan, since
 /// one permission-denied file should not blank the entire view.
 pub fn scan_dir(dir: &Path) -> io::Result<Vec<Entry>> {
+    if crate::archive::location(dir).is_some() {
+        return crate::archive::list(dir);
+    }
     let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
         let Ok(meta) = entry.metadata() else { continue };
         let path = entry.path();
-        let kind = if meta.is_dir() { MediaKind::Directory } else { MediaKind::from_path(&path) };
+        let kind = if meta.is_dir() || crate::archive::is_zip(&path) {
+            MediaKind::Directory
+        } else {
+            MediaKind::from_path(&path)
+        };
         entries.push(Entry {
+            cache_tag: None,
             name: entry.file_name().to_string_lossy().into_owned(),
             kind,
             len: if meta.is_dir() { 0 } else { meta.len() },

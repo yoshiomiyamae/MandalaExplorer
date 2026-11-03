@@ -22,11 +22,19 @@ pub enum SortKey {
     /// Running time. Anything without one -- stills, and video not yet probed
     /// -- sorts last in both directions.
     Duration,
+    /// Number of immediate files in a folder, excluding nested descendants.
+    FileCount,
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 5] =
-        [SortKey::Name, SortKey::Kind, SortKey::Size, SortKey::Modified, SortKey::Duration];
+    pub const ALL: [SortKey; 6] = [
+        SortKey::Name,
+        SortKey::Kind,
+        SortKey::Size,
+        SortKey::Modified,
+        SortKey::Duration,
+        SortKey::FileCount,
+    ];
 
     /// Whether ordering by this key needs facts that are not in an [`Entry`]
     /// and have to be fetched by opening the file.
@@ -78,11 +86,57 @@ pub fn sort_entries<F>(entries: &mut [Entry], sort: Sort, duration_of: F)
 where
     F: Fn(&Entry) -> Option<Duration>,
 {
+    sort_entries_with_counts(entries, sort, duration_of, |_| None);
+}
+
+/// Adds asynchronously obtained folder counts without making sorting do I/O.
+pub fn sort_entries_with_counts<F, C>(
+    entries: &mut [Entry],
+    sort: Sort,
+    duration_of: F,
+    count_of: C,
+) where
+    F: Fn(&Entry) -> Option<Duration>,
+    C: Fn(&Entry) -> Option<u64>,
+{
+    sort_entries_with_folder_stats(entries, sort, duration_of, count_of, |_| None);
+}
+
+/// Folder statistics are optional and supplied by background workers.
+pub fn sort_entries_with_folder_stats<F, C, S>(
+    entries: &mut [Entry],
+    sort: Sort,
+    duration_of: F,
+    count_of: C,
+    size_of: S,
+) where
+    F: Fn(&Entry) -> Option<Duration>,
+    C: Fn(&Entry) -> Option<u64>,
+    S: Fn(&Entry) -> Option<u64>,
+{
     entries.sort_by(|a, b| {
         // Directories ahead of files, and never reversed.
         b.is_dir()
             .cmp(&a.is_dir())
-            .then_with(|| compare(a, b, sort, &duration_of))
+            .then_with(|| {
+                if matches!(sort.key, SortKey::FileCount | SortKey::Size)
+                    && a.is_dir()
+                    && b.is_dir()
+                {
+                    let values = if sort.key == SortKey::Size {
+                        (size_of(a), size_of(b))
+                    } else {
+                        (count_of(a), count_of(b))
+                    };
+                    return match values {
+                        (Some(x), Some(y)) => sort.order.apply(x.cmp(&y)),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => sort.order.apply(natural_cmp(&a.name, &b.name)),
+                    };
+                }
+                compare(a, b, sort, &duration_of)
+            })
             // Ties fall back to name so the order is total, and so a redraw
             // cannot shuffle equal entries around.
             .then_with(|| natural_cmp(&a.name, &b.name))
@@ -114,6 +168,7 @@ where
             (None, Some(_)) => Ordering::Greater,
             (None, None) => Ordering::Equal,
         },
+        SortKey::FileCount => natural_cmp(&a.name, &b.name),
     }
 }
 
@@ -140,12 +195,61 @@ fn extension(entry: &Entry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recursive_folder_sizes_sort_with_unknown_last() {
+        let mut entries = vec![dir("unknown"), dir("large"), dir("small"), entry("file", 3, 0)];
+        for order in [SortOrder::Ascending, SortOrder::Descending] {
+            sort_entries_with_folder_stats(
+                &mut entries,
+                Sort { key: SortKey::Size, order },
+                |_| None,
+                |_| None,
+                |e| match e.name.as_str() {
+                    "large" => Some(100),
+                    "small" => Some(5),
+                    _ => None,
+                },
+            );
+            assert_eq!(
+                entries[0].name,
+                if order == SortOrder::Ascending { "small" } else { "large" }
+            );
+            assert_eq!(entries[2].name, "unknown");
+            assert_eq!(entries[3].name, "file");
+        }
+    }
+    #[test]
+    fn folder_counts_keep_unknown_last_in_both_directions() {
+        let mut entries: Vec<_> = ["unknown", "many", "few"]
+            .into_iter()
+            .map(|name| {
+                let mut e = entry(name, 0, 0);
+                e.kind = MediaKind::Directory;
+                e
+            })
+            .collect();
+        for order in [SortOrder::Ascending, SortOrder::Descending] {
+            sort_entries_with_counts(
+                &mut entries,
+                Sort { key: SortKey::FileCount, order },
+                |_| None,
+                |e| match e.name.as_str() {
+                    "many" => Some(9),
+                    "few" => Some(1),
+                    _ => None,
+                },
+            );
+            assert_eq!(entries[2].name, "unknown");
+            assert_eq!(entries[0].name, if order == SortOrder::Ascending { "few" } else { "many" });
+        }
+    }
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     fn entry(name: &str, len: u64, minutes_old: u64) -> Entry {
         let kind = MediaKind::from_path(&PathBuf::from(name));
         Entry {
+            cache_tag: None,
             path: PathBuf::from(name),
             name: name.to_owned(),
             kind,
@@ -156,6 +260,7 @@ mod tests {
 
     fn dir(name: &str) -> Entry {
         Entry {
+            cache_tag: None,
             path: PathBuf::from(name),
             name: name.to_owned(),
             kind: MediaKind::Directory,

@@ -13,6 +13,8 @@ use std::time::Duration;
 /// EXIF orientation, an ICC pass, the first frame of an animation -- is learned
 /// once for every caller.
 pub fn load(path: &Path) -> Result<Frame> {
+    let local = mandala_core::archive::resolve(path)?;
+    let path = local.path();
     let image = decode(path)?;
     let (width, height) = (image.width(), image.height());
     Ok(Frame { width, height, rgba: image.into_rgba8().into_raw(), timestamp: Duration::ZERO })
@@ -26,6 +28,8 @@ pub fn load(path: &Path) -> Result<Frame> {
 /// other format Windows happens to know -- camera raw, JPEG XR -- arrives for
 /// free instead of needing a list kept in step with two decoders.
 pub fn load_thumbnail(path: &Path, max: (u32, u32)) -> Result<Frame> {
+    let local = mandala_core::archive::resolve(path)?;
+    let path = local.path();
     let image = match decode(path) {
         Ok(image) => image,
         #[cfg(windows)]
@@ -59,6 +63,23 @@ fn decode(path: &Path) -> Result<image::DynamicImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnails_decode_images_inside_zip_subfolders() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let source = write_png(tmp.path(), "source.png", 80, 40);
+        let archive = tmp.path().join("pictures.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("旅行/写真.png", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(&std::fs::read(source).unwrap()).unwrap();
+        zip.finish().unwrap();
+        let path = archive.join("旅行/写真.png");
+        let frame = load_thumbnail(&path, (20, 20)).unwrap();
+        assert_eq!((frame.width, frame.height), (20, 10));
+        assert_eq!(&frame.rgba[..4], &[10, 20, 30, 255]);
+        assert_eq!(load(&path).unwrap().width, 80);
+    }
 
     fn write_png(dir: &Path, name: &str, w: u32, h: u32) -> std::path::PathBuf {
         let path = dir.join(name);
