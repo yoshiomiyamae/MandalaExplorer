@@ -63,6 +63,17 @@ struct Index {
     id: ArchiveId,
     metadata: Arc<zip::read::ZipArchiveMetadata>,
     members: BTreeMap<PathBuf, Member>,
+    folders: BTreeMap<PathBuf, FolderStats>,
+}
+
+struct FolderStats {
+    files: u64,
+    bytes: Option<u64>,
+}
+impl Default for FolderStats {
+    fn default() -> Self {
+        Self { files: 0, bytes: Some(0) }
+    }
 }
 type IndexResult = Result<Arc<Index>, (io::ErrorKind, String)>;
 type IndexCell = Arc<OnceLock<IndexResult>>;
@@ -123,7 +134,25 @@ fn build_index(id: ArchiveId) -> io::Result<Index> {
             modified: file.last_modified().and_then(zip_time),
         });
     }
-    Ok(Index { id, metadata: zip.metadata(), members })
+    let mut folders = BTreeMap::<PathBuf, FolderStats>::new();
+    folders.entry(PathBuf::new()).or_default();
+    for (path, member) in &members {
+        if member.directory {
+            folders.entry(path.clone()).or_default();
+        }
+        if let Some(parent) = path.parent() {
+            if !member.directory {
+                folders.entry(parent.to_path_buf()).or_default().files += 1;
+            }
+            for ancestor in parent.ancestors() {
+                let stats = folders.entry(ancestor.to_path_buf()).or_default();
+                if !member.directory {
+                    stats.bytes = stats.bytes.and_then(|size| size.checked_add(member.len));
+                }
+            }
+        }
+    }
+    Ok(Index { id, metadata: zip.metadata(), members, folders })
 }
 
 // DOS ZIP timestamps carry no timezone. Use one fixed offset for stable ordering
@@ -225,34 +254,39 @@ pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
 
 /// Sum uncompressed sizes from ZIP metadata without extracting any payload.
 pub fn total_size(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<u64> {
+    folder_stat(path, cancelled, |stats| stats.bytes)
+}
+
+/// Immediate file count is preaggregated once, not scanned for every sibling.
+pub fn file_count(path: &Path, cancelled: impl Fn() -> bool) -> io::Result<u64> {
+    folder_stat(path, cancelled, |stats| Some(stats.files))
+}
+
+fn folder_stat(
+    path: &Path,
+    cancelled: impl Fn() -> bool,
+    value: impl FnOnce(&FolderStats) -> Option<u64>,
+) -> io::Result<u64> {
+    if cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
     let (archive, inside) = location(path).ok_or_else(|| io::Error::other("not a ZIP folder"))?;
     let index = index_for(&archive)?;
-    let mut found = inside.as_os_str().is_empty();
-    let mut total = 0u64;
-    for (member, entry) in &index.members {
-        if cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-        }
-        if member.starts_with(&inside) {
-            found = true;
-            if !entry.directory {
-                total = total
-                    .checked_add(entry.len)
-                    .ok_or_else(|| io::Error::other("size overflow"))?;
-            }
-        }
+    if cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
     }
-    if !found {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "ZIP folder not found"));
-    }
-    Ok(total)
+    let stats = index
+        .folders
+        .get(&inside)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ZIP folder not found"))?;
+    value(stats).ok_or_else(|| io::Error::other("size overflow"))
 }
 
 /// Keeps a temporary file alive while a decoder uses it. Weak caching shares
 /// concurrent readers; releasing the last reader removes the extracted data.
 pub struct LocalFile {
     path: PathBuf,
-    _temporary: Option<Arc<tempfile::NamedTempFile>>,
+    _temporary: Option<Arc<ExtractedFile>>,
 }
 
 impl LocalFile {
@@ -265,7 +299,31 @@ const MAX_ACTIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 enum Extracted {
     Loading(u64),
-    Ready(Weak<tempfile::NamedTempFile>, u64),
+    Ready(Weak<ExtractedFile>, u64),
+}
+
+struct ExtractedFile {
+    file: Option<tempfile::NamedTempFile>,
+    cache: Weak<ExtractionCache>,
+}
+impl ExtractedFile {
+    fn path(&self) -> &Path {
+        self.file.as_ref().unwrap().path()
+    }
+}
+impl Drop for ExtractedFile {
+    fn drop(&mut self) {
+        // Delete the temporary file without holding the global cache mutex.
+        drop(self.file.take());
+        if let Some(cache) = self.cache.upgrade() {
+            let mut entries = cache.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries.retain(|_, entry| match entry {
+                Extracted::Loading(_) => true,
+                Extracted::Ready(file, _) => file.strong_count() > 0,
+            });
+            cache.changed.notify_all();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -290,11 +348,16 @@ impl Drop for Reservation<'_> {
 
 impl ExtractionCache {
     fn get(
-        &self,
+        self: &Arc<Self>,
         key: String,
         size: u64,
         load: impl FnOnce() -> io::Result<tempfile::NamedTempFile>,
-    ) -> io::Result<Arc<tempfile::NamedTempFile>> {
+    ) -> io::Result<Arc<ExtractedFile>> {
+        if size > MAX_IMAGE_BYTES {
+            return Err(io::Error::other(
+                "ZIP image exceeds the temporary extraction limit (256 MiB per image)",
+            ));
+        }
         let mut entries =
             self.entries.lock().map_err(|_| io::Error::other("ZIP cache lock poisoned"))?;
         loop {
@@ -324,10 +387,12 @@ impl ExtractionCache {
                     Extracted::Loading(size) | Extracted::Ready(_, size) => *size,
                 })
                 .sum();
-            if size > MAX_IMAGE_BYTES || size > MAX_ACTIVE_BYTES.saturating_sub(used) {
-                return Err(io::Error::other(
-                    "ZIP image exceeds the temporary extraction limit (256 MiB per image, 512 MiB total)",
-                ));
+            if size > MAX_ACTIVE_BYTES.saturating_sub(used) {
+                entries = self
+                    .changed
+                    .wait(entries)
+                    .map_err(|_| io::Error::other("ZIP cache lock poisoned"))?;
+                continue;
             }
             entries.insert(key.clone(), Extracted::Loading(size));
             break;
@@ -335,7 +400,8 @@ impl ExtractionCache {
         drop(entries);
         let _reservation = Reservation { cache: self, key: key.clone() };
         // Opening, decompressing and writing happen with no cache mutex held.
-        let temporary = Arc::new(load()?);
+        let temporary =
+            Arc::new(ExtractedFile { file: Some(load()?), cache: Arc::downgrade(self) });
         self.entries
             .lock()
             .map_err(|_| io::Error::other("ZIP cache lock poisoned"))?
@@ -363,7 +429,7 @@ pub fn resolve(path: &Path) -> io::Result<LocalFile> {
         .get(&member)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ZIP member not found"))?;
     let key = format!("{:?}:{:?}:{:?}", index.id, member, info.crc);
-    static FILES: OnceLock<ExtractionCache> = OnceLock::new();
+    static FILES: OnceLock<Arc<ExtractionCache>> = OnceLock::new();
     let temporary = FILES.get_or_init(Default::default).get(key, info.len, || {
         let mut zip = reader(&index)?;
         let mut file = zip.by_index(info.index)?;
@@ -389,6 +455,40 @@ pub fn resolve(path: &Path) -> io::Result<LocalFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sibling_folder_statistics_are_preaggregated_once_per_index() {
+        use std::cell::Cell;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("folders.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        for i in 0..128 {
+            zip.start_file(
+                format!("folder{i}/image.png"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(b"image").unwrap();
+        }
+        zip.finish().unwrap();
+        let index = index_for(&path).unwrap();
+        assert_eq!(index.folders.len(), 129);
+        assert_eq!(total_size(&path, || false).unwrap(), 640);
+        assert_eq!(file_count(&path, || false).unwrap(), 0);
+        for i in 0..128 {
+            let folder = path.join(format!("folder{i}"));
+            let calls = Cell::new(0);
+            assert_eq!(
+                total_size(&folder, || {
+                    calls.set(calls.get() + 1);
+                    false
+                })
+                .unwrap(),
+                5
+            );
+            assert_eq!(calls.get(), 2, "query must not iterate the member map");
+            assert_eq!(file_count(&folder, || false).unwrap(), 1);
+        }
+    }
     #[test]
     fn a_blocked_loader_does_not_block_other_members() {
         use std::sync::mpsc;
@@ -418,7 +518,8 @@ mod tests {
 
     #[test]
     fn failed_reservations_release_budget_and_live_files_share_the_limit() {
-        let cache = ExtractionCache::default();
+        use std::sync::mpsc;
+        let cache = Arc::new(ExtractionCache::default());
         assert!(
             cache
                 .get("failed".into(), MAX_IMAGE_BYTES, || Err(io::Error::other("failed")))
@@ -430,11 +531,28 @@ mod tests {
         let second =
             cache.get("second".into(), MAX_IMAGE_BYTES, tempfile::NamedTempFile::new).unwrap();
         assert!(
-            cache.get("third".into(), 1, || panic!("budget must be reserved before I/O")).is_err()
+            cache
+                .get("oversized".into(), MAX_IMAGE_BYTES + 1, || panic!(
+                    "oversized request reached I/O"
+                ))
+                .is_err()
         );
+        let waiting_cache = cache.clone();
+        let (done, result) = mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            let third = waiting_cache.get("third".into(), 1, tempfile::NamedTempFile::new);
+            done.send(third.is_ok()).unwrap();
+        });
+        let blocked = result.recv_timeout(Duration::from_millis(50)).is_err();
         drop(first);
-        assert!(cache.get("third".into(), 1, tempfile::NamedTempFile::new).is_ok());
+        let resumed = result.recv_timeout(Duration::from_secs(2));
         drop(second);
+        // Also unblock a broken notification implementation before joining,
+        // so the regression test fails rather than hanging indefinitely.
+        cache.changed.notify_all();
+        waiting.join().unwrap();
+        assert!(blocked, "temporary pressure must wait, not reject");
+        assert!(resumed.unwrap(), "last reader must wake capacity waiters");
     }
 
     #[test]

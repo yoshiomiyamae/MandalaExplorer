@@ -39,7 +39,9 @@ impl Counts {
                         break;
                     }
                     let count = match metric {
-                        Metric::FileCount => count_files(&path),
+                        Metric::FileCount => {
+                            count_files(&path, || current.load(Ordering::Relaxed) != id)
+                        }
                         Metric::Size => {
                             folder_bytes(&path, || current.load(Ordering::Relaxed) != id)
                         }
@@ -77,14 +79,18 @@ impl Drop for Counts {
     }
 }
 
-fn count_files(path: &Path) -> Option<u64> {
+fn count_files(path: &Path, cancelled: impl Fn() -> bool) -> Option<u64> {
+    if cancelled() {
+        return None;
+    }
     if mandala_core::archive::location(path).is_some() {
-        return mandala_core::archive::list(path)
-            .ok()
-            .map(|entries| entries.iter().filter(|e| !e.is_dir()).count() as u64);
+        return mandala_core::archive::file_count(path, cancelled).ok();
     }
     let mut count = 0;
     for entry in std::fs::read_dir(path).ok()? {
+        if cancelled() {
+            return None;
+        }
         let entry = entry.ok()?;
         if entry.metadata().ok()?.is_file() {
             count += 1;
@@ -151,6 +157,23 @@ fn folder_bytes(path: &Path, cancelled: impl Fn() -> bool) -> Option<u64> {
 mod tests {
     use super::*;
     #[test]
+    fn file_count_checks_cancellation_between_directory_entries() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let calls = Cell::new(0);
+        assert_eq!(
+            count_files(dir.path(), || {
+                calls.set(calls.get() + 1);
+                calls.get() > 2
+            }),
+            None
+        );
+        assert_eq!(calls.get(), 3);
+    }
+    #[test]
     fn zip_size_uses_uncompressed_sizes_recursively_without_extraction() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -213,8 +236,8 @@ mod tests {
             writer.write_all(b"test").unwrap();
         }
         writer.finish().unwrap();
-        assert_eq!(count_files(&path), Some(2));
-        assert_eq!(count_files(&path.join("child")), Some(1));
+        assert_eq!(count_files(&path, || false), Some(2));
+        assert_eq!(count_files(&path.join("child"), || false), Some(1));
     }
 
     #[test]
@@ -234,7 +257,7 @@ mod tests {
         std::fs::write(dir.path().join("one.txt"), b"1").unwrap();
         std::fs::create_dir(dir.path().join("child")).unwrap();
         std::fs::write(dir.path().join("child/two.txt"), b"2").unwrap();
-        assert_eq!(count_files(dir.path()), Some(1));
-        assert_eq!(count_files(&dir.path().join("missing")), None);
+        assert_eq!(count_files(dir.path(), || false), Some(1));
+        assert_eq!(count_files(&dir.path().join("missing"), || false), None);
     }
 }

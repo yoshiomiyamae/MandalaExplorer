@@ -429,23 +429,45 @@ impl ThumbnailService {
         self.queue.try_prefetch(job, epoch)
     }
 
-    pub fn rebase_background(&self, epoch: u64, tier: u32) {
+    pub fn rebase_background(
+        &self,
+        epoch: u64,
+        tier: u32,
+        allowed: &std::collections::HashSet<PathBuf>,
+    ) -> Vec<Job> {
         let mut inner = self.queue.inner.lock().unwrap();
         inner.epoch = epoch;
+        let mut removed = Vec::new();
+        inner.pending.retain(|job| {
+            let keep = allowed.contains(job.path()) && job.tier().is_none_or(|t| t == tier);
+            if !keep {
+                removed.push(job.clone());
+            }
+            keep
+        });
         let obsolete: Vec<_> = inner
             .background
             .iter()
-            .filter(|(_, work)| work.job.tier() != Some(tier))
+            .filter(|(_, work)| work.job.tier() != Some(tier) || !allowed.contains(work.job.path()))
             .map(|(sequence, _)| *sequence)
             .collect();
         for sequence in obsolete {
             if let Some(work) = inner.background.remove(&sequence) {
                 inner.background_ids.remove(&(work.job.path().to_path_buf(), work.job.tier()));
+                removed.push(work.job);
             }
         }
         for work in inner.background.values_mut() {
             work.prefetch_epoch = Some(epoch);
         }
+        for ((id, _), promoted) in &mut inner.active_background {
+            if !allowed.contains(&id.0) {
+                *promoted = false;
+            }
+        }
+        drop(inner);
+        self.queue.wake.notify_all();
+        removed
     }
 
     pub fn defer_outside(
@@ -752,6 +774,22 @@ fn cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filtering_prunes_pending_and_deferred_work_but_keeps_matching_fifo_work() {
+        let service = test_service();
+        service.request(thumbnail_job(1));
+        service.request(thumbnail_job(2));
+        service.defer_outside(&Default::default(), 128, 5);
+        service.request(thumbnail_job(3));
+        let allowed = [PathBuf::from("a1")].into_iter().collect();
+        let dropped = service.rebase_background(6, 128, &allowed);
+        assert_eq!(dropped.len(), 2);
+        service.defer_outside(&Default::default(), 128, 6);
+        let inner = service.queue.inner.lock().unwrap();
+        assert!(inner.pending.is_empty());
+        assert_eq!(inner.background.len(), 1);
+        assert_eq!(inner.background.first_key_value().unwrap().1.job.path(), Path::new("a1"));
+    }
 
     fn resume_background(queue: &Queue) {
         queue.inner.lock().unwrap().budget.observe(None, false);
@@ -1301,7 +1339,7 @@ mod tests {
         let service = test_service();
         service.request(thumbnail_job(1));
         service.defer_outside(&Default::default(), 128, 5);
-        service.rebase_background(6, 128);
+        service.rebase_background(6, 128, &[PathBuf::from("a1")].into_iter().collect());
         assert_eq!(service.queue.inner.lock().unwrap().background.len(), 1);
         assert_eq!(
             service
@@ -1316,7 +1354,7 @@ mod tests {
                 .prefetch_epoch,
             Some(6)
         );
-        service.rebase_background(7, 256);
+        service.rebase_background(7, 256, &[PathBuf::from("a1")].into_iter().collect());
         assert!(service.queue.inner.lock().unwrap().background.is_empty());
         assert!(service.queue.inner.lock().unwrap().background_ids.is_empty());
     }
@@ -1327,7 +1365,7 @@ mod tests {
         assert!(service.prefetch(thumbnail_job(1), 5));
         let work = service.queue.inner.lock().unwrap().take_ready().unwrap();
         service.clear_pending();
-        service.rebase_background(6, 128);
+        service.rebase_background(6, 128, &[PathBuf::from("a1")].into_iter().collect());
         service.request(thumbnail_job(1));
         assert_eq!(service.queue.inner.lock().unwrap().pending.len(), 1);
         assert!(!service.queue.finish(&work).promoted);

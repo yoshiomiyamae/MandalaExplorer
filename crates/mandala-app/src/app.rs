@@ -302,6 +302,18 @@ struct PlaybackInfo {
     duration: Option<Duration>,
 }
 
+/// Hit-test results must survive a resort before they are dispatched.
+struct Activation {
+    path: PathBuf,
+    directory: bool,
+    new_tab: bool,
+}
+impl Activation {
+    fn capture(entry: &Entry, new_tab: bool) -> Self {
+        Self { path: entry.path.clone(), directory: entry.is_dir(), new_tab }
+    }
+}
+
 impl MandalaApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -547,6 +559,7 @@ impl MandalaApp {
         self.navigate_to(path.clone());
         // Keep a failed tab address usable for retrying or navigating upward.
         if self.current_dir.as_os_str().is_empty() {
+            self.settings.enter_directory(Path::new(""), &path);
             self.path_edit = path.display().to_string();
             self.current_dir = path;
         }
@@ -793,15 +806,16 @@ impl MandalaApp {
         self.current_dir.parent().map(Path::to_path_buf)
     }
 
-    fn activate(&mut self, index: usize) {
-        let Some(entry) = self.entries.get(index) else { return };
-        if entry.is_dir() {
-            self.navigate_to(entry.path.clone());
-        } else if mandala_core::archive::location(&entry.path).is_some() {
+    fn activate(&mut self, activation: Activation) {
+        if activation.directory && activation.new_tab {
+            self.open_tab(activation.path);
+        } else if activation.directory {
+            self.navigate_to(activation.path);
+        } else if mandala_core::archive::location(&activation.path).is_some() {
             self.operation_error = Some(self.lang.text(Phrase::ZipPreviewOnly).to_owned());
         } else {
             // explorer.exe hands the file to whatever is registered for it.
-            let _ = std::process::Command::new("explorer.exe").arg(&entry.path).spawn();
+            let _ = std::process::Command::new("explorer.exe").arg(&activation.path).spawn();
         }
     }
 
@@ -956,7 +970,16 @@ impl MandalaApp {
 
     fn reset_prefetch(&mut self) {
         self.prefetch.reset(self.entries.len());
-        self.thumbs.rebase_background(self.prefetch.epoch, self.current_tier);
+        let allowed = self.entries.iter().map(|e| e.path.clone()).collect();
+        for dropped in
+            self.thumbs.rebase_background(self.prefetch.epoch, self.current_tier, &allowed)
+        {
+            release_request_marker(
+                dropped,
+                &mut self.requested_thumbs,
+                &mut self.requested_durations,
+            );
+        }
         self.thumbnail_view = None;
     }
 
@@ -1434,7 +1457,10 @@ impl eframe::App for MandalaApp {
                         context_requested = true;
                     }
                     if response.double_clicked() {
-                        activated = Some((index, ui.input(|i| i.modifiers.ctrl)));
+                        activated = Some(Activation::capture(
+                            &self.entries[index],
+                            ui.input(|i| i.modifiers.ctrl),
+                        ));
                     }
 
                     // The scrub strip sits on top of the tile, so it is claimed
@@ -1484,12 +1510,8 @@ impl eframe::App for MandalaApp {
         if let Some((index, position)) = seek_request {
             self.player.seek(index, position);
         }
-        if let Some((index, new_tab)) = activated {
-            if new_tab && self.entries.get(index).is_some_and(Entry::is_dir) {
-                self.open_tab(self.entries[index].path.clone());
-            } else {
-                self.activate(index);
-            }
+        if let Some(activation) = activated {
+            self.activate(activation);
         }
         if context_requested {
             if mandala_core::archive::location(&self.current_dir).is_some() {
@@ -1644,6 +1666,37 @@ fn draw_play_badge(painter: &egui::Painter, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn activation_keeps_the_clicked_identity_after_reordering() {
+        let mut entries = entries(&["first", "clicked"]);
+        let activation = Activation::capture(&entries[1], true);
+        entries.swap(0, 1);
+        assert_eq!(activation.path, PathBuf::from("clicked"));
+        assert!(activation.new_tab);
+    }
+
+    #[test]
+    fn an_unavailable_destination_loads_its_own_view_before_save_and_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let missing = tmp.path().join("unavailable");
+        let mut settings = Settings::default();
+        settings.enter_directory(Path::new(""), &first);
+        settings.tile_px = 480.0;
+        settings.enter_directory(&first, &missing);
+        settings.tile_px = 960.0;
+        settings.enter_directory(&missing, &first);
+        settings.remember_directory(&first);
+        // The failed-tab fallback must enter the destination before assigning
+        // current_dir; otherwise save/F5 would persist the first tab's view.
+        settings.enter_directory(Path::new(""), &missing);
+        assert_eq!(settings.tile_px, 960.0);
+        settings.remember_directory(&missing);
+        settings.enter_directory(&missing, &first);
+        assert_eq!(settings.tile_px, 480.0);
+        settings.enter_directory(&first, &missing);
+        assert_eq!(settings.tile_px, 960.0);
+    }
 
     #[test]
     fn deferred_requests_release_only_their_own_visible_priority_markers() {
