@@ -604,8 +604,11 @@ impl MandalaApp {
                 self.switch_tab(if index > 0 { index - 1 } else { 1 });
             }
             self.tabs.remove(index);
-            if index < self.active_tab {
-                self.active_tab -= 1;
+            let (active, restore) =
+                crate::tabs::after_close(self.active_tab, index, self.scroll_offset);
+            self.active_tab = active;
+            if restore.is_some() {
+                self.restore_scroll = restore;
             }
         }
         if duplicate {
@@ -795,7 +798,7 @@ impl MandalaApp {
         if entry.is_dir() {
             self.navigate_to(entry.path.clone());
         } else if mandala_core::archive::location(&entry.path).is_some() {
-            self.error = Some(self.lang.text(Phrase::ZipPreviewOnly).to_owned());
+            self.operation_error = Some(self.lang.text(Phrase::ZipPreviewOnly).to_owned());
         } else {
             // explorer.exe hands the file to whatever is registered for it.
             let _ = std::process::Command::new("explorer.exe").arg(&entry.path).spawn();
@@ -1706,6 +1709,7 @@ mod tests {
         paths
             .iter()
             .map(|p| Entry {
+                cache_tag: None,
                 path: PathBuf::from(p),
                 name: (*p).to_owned(),
                 kind: MediaKind::Video,

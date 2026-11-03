@@ -249,6 +249,7 @@ mod tests {
     fn entry(name: &str, len: u64, minutes_old: u64) -> Entry {
         let kind = MediaKind::from_path(&PathBuf::from(name));
         Entry {
+            cache_tag: None,
             path: PathBuf::from(name),
             name: name.to_owned(),
             kind,
@@ -259,6 +260,7 @@ mod tests {
 
     fn dir(name: &str) -> Entry {
         Entry {
+            cache_tag: None,
             path: PathBuf::from(name),
             name: name.to_owned(),
             kind: MediaKind::Directory,

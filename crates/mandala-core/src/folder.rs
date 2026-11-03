@@ -67,7 +67,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn entry(name: &str, kind: MediaKind) -> Entry {
-        Entry { path: PathBuf::from(name), name: name.to_owned(), kind, len: 1, modified: None }
+        Entry {
+            cache_tag: None,
+            path: PathBuf::from(name),
+            name: name.to_owned(),
+            kind,
+            len: 1,
+            modified: None,
+        }
     }
 
     fn image(name: &str) -> Entry {

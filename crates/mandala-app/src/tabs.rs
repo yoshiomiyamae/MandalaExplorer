@@ -5,6 +5,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// ScrollArea IDs currently use tab indices, so reindexing needs an override.
+pub fn after_close(active: usize, closed: usize, offset: f32) -> (usize, Option<f32>) {
+    if closed < active { (active - 1, Some(offset)) } else { (active, None) }
+}
+
 #[derive(Default, Clone)]
 pub struct Tab {
     pub path: PathBuf,
@@ -27,6 +32,11 @@ impl Tab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn closing_a_left_tab_restores_the_active_scroll_after_reindexing() {
+        assert_eq!(after_close(2, 0, 740.0), (1, Some(740.0)));
+        assert_eq!(after_close(0, 2, 55.0), (0, None));
+    }
 
     #[test]
     fn returning_to_a_parent_restores_its_scroll() {

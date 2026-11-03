@@ -1026,8 +1026,20 @@ mod tests {
             .unwrap();
         let cached_frame = produce_folder(&archive, 128, &cache, &backend).unwrap();
         assert!(cached_frame.rgba[0] > 200);
-        // A corrupt cache must fall back rather than returning an empty tile.
+        // A broken cover can now be repaired from the cached ZIP index and
+        // member thumbnail, without rereading the corrupt archive payload.
         std::fs::write(cached, b"broken JPEG").unwrap();
+        assert!(produce_folder(&archive, 128, &cache, &backend).unwrap().rgba[0] > 200);
+        // A new fingerprint must invalidate that index and fail on corruption.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(metadata.modified().unwrap() + Duration::from_secs(2)),
+            )
+            .unwrap();
         assert!(produce_folder(&archive, 128, &cache, &backend).is_err());
     }
 

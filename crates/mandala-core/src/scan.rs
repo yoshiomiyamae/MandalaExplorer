@@ -11,6 +11,8 @@ use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// Source identity independent of the displayed size and modification time.
+    pub cache_tag: Option<[u8; 32]>,
     pub path: PathBuf,
     pub name: String,
     pub kind: MediaKind,
@@ -57,6 +59,7 @@ pub fn scan_dir(dir: &Path) -> io::Result<Vec<Entry>> {
             MediaKind::from_path(&path)
         };
         entries.push(Entry {
+            cache_tag: None,
             name: entry.file_name().to_string_lossy().into_owned(),
             kind,
             len: if meta.is_dir() { 0 } else { meta.len() },

@@ -79,6 +79,7 @@ mod tests {
     fn entries() -> Vec<Entry> {
         (0..6)
             .map(|i| Entry {
+                cache_tag: None,
                 path: PathBuf::from(format!("{i}.png")),
                 name: format!("{i}.png"),
                 kind: MediaKind::Image,
